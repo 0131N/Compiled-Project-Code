@@ -21,6 +21,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import scipy.signal
@@ -71,15 +72,17 @@ def get_integration_time(filename):
 
 
 def extract_experiment_params(filename):
-    """Extracts Power (W), Pressure (mTorr), and Argon % from filename."""
+    """Extracts Power (W), Pressure (mTorr), Argon %, and Flow rate (sccm) from filename."""
     base = os.path.basename(filename)
     power_m    = re.search(r'(\d+\.?\d*)\s*W',     base, re.IGNORECASE)
     pressure_m = re.search(r'(\d+\.?\d*)\s*mTorr', base, re.IGNORECASE)
     argon_m    = re.search(r'argon(\d+\.?\d*)%',   base, re.IGNORECASE)
+    flow_m     = re.search(r'(\d+\.?\d*)\s*sccm',  base, re.IGNORECASE)
     power    = float(power_m.group(1))    if power_m    else None
     pressure = float(pressure_m.group(1)) if pressure_m else None
     argon    = float(argon_m.group(1))    if argon_m    else None
-    return power, pressure, argon
+    flow     = float(flow_m.group(1))     if flow_m     else None
+    return power, pressure, argon, flow
 
 
 def clean_name(filepath):
@@ -346,7 +349,7 @@ def plot_vib_temp_trends(results):
         tv = data.get('Vibrational Temperature')
         if tv is None:
             continue
-        power, pressure, _ = extract_experiment_params(filename)
+        power, pressure, _, __ = extract_experiment_params(filename)
         if power    is not None: power_pts.append((power, tv))
         if pressure is not None: pressure_pts.append((pressure, tv))
 
@@ -416,13 +419,13 @@ def perform_pca(results):
         tag = "SIGNIFICANT" if eig > 1.0 else "noise"
         print(f"  PC{i+1}: λ={eig:.3f}  ({var:.1f}%)  [{tag}]")
 
-    # Extract pressure and argon% per sample for colouring
+    # Extract pressure and flow rate per sample for colouring
     pressures  = []
-    argon_pcts = []
+    flow_rates = []
     for sample_file in results['sample_results'].keys():
-        _, pressure, argon = extract_experiment_params(sample_file)
+        _, pressure, _, flow = extract_experiment_params(sample_file)
         pressures.append(pressure)
-        argon_pcts.append(argon)
+        flow_rates.append(flow)
 
     return {
         'transformed':   transformed,
@@ -432,7 +435,7 @@ def perform_pca(results):
         'labels':        peak_labels,
         'samples':       sample_names,
         'pressures':     pressures,
-        'argon_pcts':    argon_pcts,
+        'flow_rates':    flow_rates,
     }
 
 
@@ -441,12 +444,16 @@ def plot_pca(pca_data):
         return
 
     pressures  = pca_data['pressures']
-    argon_pcts = pca_data['argon_pcts']
+    flow_rates = pca_data['flow_rates']
+    T          = pca_data['transformed']
 
-    # ── Figure 1: Scree + Score plot ──────────────────────────────────
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    # Need at least 3 PCs for 3D plot
+    if T.shape[1] < 3:
+        print("  Fewer than 3 PCs available — cannot plot 3D score plot.")
+        return
 
-    # Scree plot
+    # ── Figure 1: Scree plot ──────────────────────────────────────────
+    fig1, ax1 = plt.subplots(figsize=(7, 5))
     ax1.bar(range(1, len(pca_data['eigenvalues']) + 1),
             pca_data['eigenvalues'], color=COLOURS['blue'], width=0.6)
     ax1.axhline(y=1, color=COLOURS['red'], linestyle='--', linewidth=1,
@@ -455,8 +462,11 @@ def plot_pca(pca_data):
     ax1.set_ylabel('Eigenvalue')
     ax1.legend(frameon=False, fontsize=9)
     apply_thesis_style(ax1)
+    plt.tight_layout()
+    plt.show()
 
-    # Score plot — colour by pressure, marker shape by argon %
+    # ── Figure 2: 3D Score plot ───────────────────────────────────────
+    # Colour = pressure, size = flow rate
     valid_pressures = [p for p in pressures if p is not None]
     pressure_norm   = mcolors.Normalize(
         vmin=min(valid_pressures) * 0.8,
@@ -464,42 +474,59 @@ def plot_pca(pca_data):
     ) if valid_pressures else mcolors.Normalize(0, 1)
     pressure_cmap = plt.get_cmap('Blues')
 
-    unique_argons = sorted(set(a for a in argon_pcts if a is not None))
-    marker_map    = {a: m for a, m in zip(unique_argons, ['o', 's', '^', 'D', 'v'])}
+    flow_rates    = [0.0 if f is None else f for f in flow_rates]
+    unique_flows  = sorted(set(flow_rates))
+    # Map flow rates to marker sizes: smallest flow = smallest marker
+    min_f, max_f  = (min(unique_flows), max(unique_flows)) if len(unique_flows) > 1 else (0, 1)
+    def flow_to_size(f):
+        if max_f == min_f:
+            return 80
+        return 40 + 120 * (f - min_f) / (max_f - min_f)
 
-    for i in range(len(pca_data['samples'])):
-        p      = pressures[i]
-        arg    = argon_pcts[i]
-        colour = pressure_cmap(pressure_norm(p)) if p is not None else COLOURS['grey']
-        marker = marker_map.get(arg, 'o')
+    colours = [pressure_cmap(pressure_norm(p)) if p is not None else COLOURS['grey']
+               for p in pressures]
+    sizes   = [flow_to_size(f) for f in flow_rates]
 
-        ax2.scatter(pca_data['transformed'][i, 0],
-                    pca_data['transformed'][i, 1],
-                    color=colour, marker=marker, s=70, zorder=3,
-                    edgecolors='#333333', linewidths=0.5)
+    fig2 = plt.figure(figsize=(10, 7))
+    ax3d = fig2.add_subplot(111, projection='3d')
 
-    ax2.set_xlabel(f"PC1 ({pca_data['explained_var'][0]:.1f}%)")
-    ax2.set_ylabel(f"PC2 ({pca_data['explained_var'][1]:.1f}%)")
-    apply_thesis_style(ax2)
+    sc = ax3d.scatter(
+        T[:, 0], T[:, 1], T[:, 2],
+        c=colours, s=sizes,
+        edgecolors='#333333', linewidths=0.4, depthshade=True
+    )
+
+    ax3d.set_xlabel(f"PC1 ({pca_data['explained_var'][0]:.1f}%)", labelpad=8)
+    ax3d.set_ylabel(f"PC2 ({pca_data['explained_var'][1]:.1f}%)", labelpad=8)
+    ax3d.set_zlabel(f"PC3 ({pca_data['explained_var'][2]:.1f}%)", labelpad=8)
+
+    # Remove top pane and style the axes
+    ax3d.xaxis.pane.fill = False
+    ax3d.yaxis.pane.fill = False
+    ax3d.zaxis.pane.fill = False
+    ax3d.xaxis.pane.set_edgecolor('#cccccc')
+    ax3d.yaxis.pane.set_edgecolor('#cccccc')
+    ax3d.zaxis.pane.set_edgecolor('#cccccc')
+    ax3d.tick_params(labelsize=8)
 
     # Pressure colourbar
     sm = cm.ScalarMappable(cmap='Blues', norm=pressure_norm)
     sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax2, pad=0.02, shrink=0.8)
+    cbar = fig2.colorbar(sm, ax=ax3d, pad=0.1, shrink=0.6)
     cbar.set_label('Pressure (mTorr)', fontsize=9)
     cbar.ax.tick_params(labelsize=8, direction='in')
     cbar.outline.set_linewidth(0.5)
 
-    # Argon % legend via marker shapes
-    if len(unique_argons) > 1:
-        handles = [
-            plt.scatter([], [], marker=marker_map[a], color='#888888',
-                        edgecolors='#333333', linewidths=0.5, s=50,
-                        label=f'Ar {a:.0f}%')
-            for a in unique_argons
+    # Flow rate size legend
+    if len(unique_flows) > 1:
+        size_handles = [
+            plt.scatter([], [], s=flow_to_size(f), color='#888888',
+                        edgecolors='#333333', linewidths=0.4,
+                        label=f'{f:.0f} sccm')
+            for f in unique_flows
         ]
-        ax2.legend(handles=handles, frameon=False, fontsize=8,
-                   loc='lower right', title='Argon %', title_fontsize=8)
+        ax3d.legend(handles=size_handles, frameon=False, fontsize=8,
+                    loc='upper left', title='Flow Rate', title_fontsize=8)
 
     plt.tight_layout()
     plt.show()
