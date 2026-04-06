@@ -194,6 +194,7 @@ def calculate_vibrational_temperature(wavelength, intensity, sample_name=""):
         return None, None
 
 
+
 # ─────────────────────────────────────────────
 #  Core analysis
 # ─────────────────────────────────────────────
@@ -419,13 +420,13 @@ def perform_pca(results):
         tag = "SIGNIFICANT" if eig > 1.0 else "noise"
         print(f"  PC{i+1}: λ={eig:.3f}  ({var:.1f}%)  [{tag}]")
 
-    # Extract pressure and flow rate per sample for colouring
+    # Extract pressure and argon% per sample for colouring
     pressures  = []
-    flow_rates = []
+    argon_pcts = []
     for sample_file in results['sample_results'].keys():
-        _, pressure, _, flow = extract_experiment_params(sample_file)
+        _, pressure, argon, _ = extract_experiment_params(sample_file)
         pressures.append(pressure)
-        flow_rates.append(flow)
+        argon_pcts.append(argon if argon is not None else 0.0)
 
     return {
         'transformed':   transformed,
@@ -435,7 +436,7 @@ def perform_pca(results):
         'labels':        peak_labels,
         'samples':       sample_names,
         'pressures':     pressures,
-        'flow_rates':    flow_rates,
+        'argon_pcts':    argon_pcts,
     }
 
 
@@ -444,7 +445,7 @@ def plot_pca(pca_data):
         return
 
     pressures  = pca_data['pressures']
-    flow_rates = pca_data['flow_rates']
+    argon_pcts = pca_data['argon_pcts']
     T          = pca_data['transformed']
 
     # Need at least 3 PCs for 3D plot
@@ -466,31 +467,28 @@ def plot_pca(pca_data):
     plt.show()
 
     # ── Figure 2: 3D Score plot ───────────────────────────────────────
-    # Colour = pressure, size = flow rate
+    # Colour = pressure (plasma), size = argon %
     valid_pressures = [p for p in pressures if p is not None]
     pressure_norm   = mcolors.Normalize(
         vmin=min(valid_pressures) * 0.8,
         vmax=max(valid_pressures) * 1.1
     ) if valid_pressures else mcolors.Normalize(0, 1)
-    pressure_cmap = plt.get_cmap('Blues')
+    pressure_cmap = plt.get_cmap('plasma')
 
-    flow_rates    = [0.0 if f is None else f for f in flow_rates]
-    unique_flows  = sorted(set(flow_rates))
-    # Map flow rates to marker sizes: smallest flow = smallest marker
-    min_f, max_f  = (min(unique_flows), max(unique_flows)) if len(unique_flows) > 1 else (0, 1)
-    def flow_to_size(f):
-        if max_f == min_f:
-            return 80
-        return 40 + 120 * (f - min_f) / (max_f - min_f)
+    unique_argons = sorted(set(argon_pcts))
+    min_a = min(unique_argons)
+    max_a = max(unique_argons) if max(unique_argons) != min_a else min_a + 1
+    def argon_to_size(a):
+        return 40 + 120 * (a - min_a) / (max_a - min_a)
 
     colours = [pressure_cmap(pressure_norm(p)) if p is not None else COLOURS['grey']
                for p in pressures]
-    sizes   = [flow_to_size(f) for f in flow_rates]
+    sizes   = [argon_to_size(a) for a in argon_pcts]
 
     fig2 = plt.figure(figsize=(10, 7))
     ax3d = fig2.add_subplot(111, projection='3d')
 
-    sc = ax3d.scatter(
+    ax3d.scatter(
         T[:, 0], T[:, 1], T[:, 2],
         c=colours, s=sizes,
         edgecolors='#333333', linewidths=0.4, depthshade=True
@@ -500,38 +498,77 @@ def plot_pca(pca_data):
     ax3d.set_ylabel(f"PC2 ({pca_data['explained_var'][1]:.1f}%)", labelpad=8)
     ax3d.set_zlabel(f"PC3 ({pca_data['explained_var'][2]:.1f}%)", labelpad=8)
 
-    # Remove top pane and style the axes
     ax3d.xaxis.pane.fill = False
     ax3d.yaxis.pane.fill = False
     ax3d.zaxis.pane.fill = False
-    ax3d.xaxis.pane.set_edgecolor('#cccccc')
-    ax3d.yaxis.pane.set_edgecolor('#cccccc')
-    ax3d.zaxis.pane.set_edgecolor('#cccccc')
+    ax3d.xaxis.pane.set_edgecolor('#dddddd')
+    ax3d.yaxis.pane.set_edgecolor('#dddddd')
+    ax3d.zaxis.pane.set_edgecolor('#dddddd')
+    ax3d.xaxis._axinfo['grid']['color'] = '#eeeeee'
+    ax3d.yaxis._axinfo['grid']['color'] = '#eeeeee'
+    ax3d.zaxis._axinfo['grid']['color'] = '#eeeeee'
     ax3d.tick_params(labelsize=8)
 
-    # Pressure colourbar
-    sm = cm.ScalarMappable(cmap='Blues', norm=pressure_norm)
+    sm = cm.ScalarMappable(cmap='plasma', norm=pressure_norm)
     sm.set_array([])
     cbar = fig2.colorbar(sm, ax=ax3d, pad=0.1, shrink=0.6)
     cbar.set_label('Pressure (mTorr)', fontsize=9)
     cbar.ax.tick_params(labelsize=8, direction='in')
     cbar.outline.set_linewidth(0.5)
 
-    # Flow rate size legend
-    if len(unique_flows) > 1:
+    if len(unique_argons) > 1:
         size_handles = [
-            plt.scatter([], [], s=flow_to_size(f), color='#888888',
+            plt.scatter([], [], s=argon_to_size(a), color='#888888',
                         edgecolors='#333333', linewidths=0.4,
-                        label=f'{f:.0f} sccm')
-            for f in unique_flows
+                        label=f'Ar {a:.0f}%')
+            for a in unique_argons
         ]
         ax3d.legend(handles=size_handles, frameon=False, fontsize=8,
-                    loc='upper left', title='Flow Rate', title_fontsize=8)
+                    loc='upper left', title='Argon %', title_fontsize=8)
 
     plt.tight_layout()
     plt.show()
 
-    # ── Figure 2: PC1 loadings ────────────────────────────────────────
+    # ── Figure 3: PC3 score vs Argon % ───────────────────────────────
+    # Test for nonlinear (metastable pooling) signature:
+    # if pooling is active, expect a kink/threshold rather than linear trend
+    fig3, ax_pc3 = plt.subplots(figsize=(7, 5))
+
+    pc3_scores = T[:, 2]
+    valid = [(a, s) for a, s in zip(argon_pcts, pc3_scores)]
+    valid.sort(key=lambda x: x[0])
+    x_ar = [v[0] for v in valid]
+    y_pc3 = [v[1] for v in valid]
+
+    # Scatter coloured by pressure
+    sc3 = ax_pc3.scatter(x_ar, y_pc3,
+                         c=[pressure_norm(p) if p is not None else 0 for p in pressures],
+                         cmap='plasma', s=70, zorder=3,
+                         edgecolors='#333333', linewidths=0.5)
+
+    # Light connecting line to reveal trend shape
+    ax_pc3.plot(x_ar, y_pc3, color=COLOURS['grey'], linewidth=0.8,
+                linestyle='--', zorder=2, alpha=0.5)
+
+    ax_pc3.set_xlabel('Argon concentration (%)')
+    ax_pc3.set_ylabel(f"PC3 score ({pca_data['explained_var'][2]:.1f}%)")
+    ax_pc3.text(0.98, 0.98,
+                'Nonlinear trend suggests\nmetastable pooling threshold',
+                transform=ax_pc3.transAxes, ha='right', va='top',
+                fontsize=8, color=COLOURS['grey'], style='italic')
+    apply_thesis_style(ax_pc3)
+
+    sm3 = cm.ScalarMappable(cmap='plasma', norm=pressure_norm)
+    sm3.set_array([])
+    cbar3 = fig3.colorbar(sm3, ax=ax_pc3, pad=0.02, shrink=0.8)
+    cbar3.set_label('Pressure (mTorr)', fontsize=9)
+    cbar3.ax.tick_params(labelsize=8, direction='in')
+    cbar3.outline.set_linewidth(0.5)
+
+    plt.tight_layout()
+    plt.show()
+
+    # ── Figure 4: PC1 loadings ────────────────────────────────────────
     loadings = pca_data['loadings'][0]
     labels   = pca_data['labels']
     sort_idx = np.argsort(np.abs(loadings))[::-1]
