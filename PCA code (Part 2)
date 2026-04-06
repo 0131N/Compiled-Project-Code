@@ -28,9 +28,34 @@ import math
 
 
 # ─────────────────────────────────────────────
-#  Utility helpers
+#  Plot style — publication quality
 # ─────────────────────────────────────────────
 
+# Muted colour palette
+COLOURS = {
+    'blue':   '#4878CF',
+    'red':    '#C44E52',
+    'green':  '#6ACC65',
+    'orange': '#D0732B',
+    'purple': '#8172B2',
+    'teal':   '#4DAFAA',
+    'grey':   '#555555',
+}
+
+def apply_thesis_style(ax):
+    """Apply publication-quality styling to an axes object."""
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(0.8)
+    ax.spines['bottom'].set_linewidth(0.8)
+    ax.tick_params(axis='both', direction='in', length=4, width=0.8)
+    ax.grid(False)
+
+
+# ─────────────────────────────────────────────
+#  Utility helpers
+# ─────────────────────────────────────────────
+REF_CSV    = r"c:\Users\User\oceanview\Nitrogen\Refrences\reference_peaks Nitro 30.csv" 
 def get_integration_time(filename):
     """Extracts integration time (ms) from filename, e.g. '50ms'."""
     match = re.search(r'(\d{2,3})ms', os.path.basename(filename))
@@ -70,14 +95,12 @@ def load_reference_peaks_csv(csv_file):
     Loads the reference peaks CSV written by Part 1.
     Returns list of (wavelength_nm, intensity_per_ms_or_raw) tuples.
     """
-    # Skip the comment lines that start with '#'
     df = pd.read_csv(csv_file, comment='#', encoding='utf-8')
 
     required = {'wavelength_nm', 'intensity'}
     if not required.issubset(df.columns):
         raise ValueError(f"Reference CSV must contain columns: {required}. Found: {set(df.columns)}")
 
-    # Prefer intensity_per_ms if available and not all-NaN
     if 'intensity_per_ms' in df.columns and df['intensity_per_ms'].notna().any():
         intensities = df['intensity_per_ms'].values
         print("Using 'intensity_per_ms' column from reference CSV.")
@@ -191,7 +214,6 @@ def analyse_samples_against_reference_peaks(reference_peaks, sample_files,
             print(f"  ✗ Could not load file — skipping.")
             continue
 
-        # Integration time normalisation
         int_time = get_integration_time(sample_file)
         if int_time:
             print(f"  Integration time: {int_time} ms — normalising.")
@@ -199,11 +221,9 @@ def analyse_samples_against_reference_peaks(reference_peaks, sample_files,
         else:
             print("  No integration time in filename — using raw counts.")
 
-        # Vibrational temperature
         t_vib, _ = calculate_vibrational_temperature(wavelength, intensity,
                                                      sample_name=clean_name(sample_file))
 
-        # Intensity at each reference peak
         peak_data = []
         for ref_wl, ref_int in reference_peaks:
             sample_int, wl_diff = get_intensity_at_wavelength(
@@ -290,7 +310,7 @@ def plot_sample_spectra(results):
     if n == 0:
         return
 
-    ref_wls  = [p[0] for p in results['reference_peaks']]
+    ref_wls = [p[0] for p in results['reference_peaks']]
 
     fig, axes = plt.subplots(n, 1, figsize=(13, 4 * n), squeeze=False)
 
@@ -299,26 +319,30 @@ def plot_sample_spectra(results):
         iny = data['intensity']
         y_label = 'Intensity / ms' if data.get('integration_time') else 'Intensity'
 
-        ax.plot(wl, iny, 'g-', linewidth=0.8, label='Sample spectrum')
+        ax.plot(wl, iny, color=COLOURS['teal'], linewidth=0.8, label='Sample spectrum')
 
         sample_ints = [p['sample_intensity'] for p in data['peak_data']]
-        ax.plot(ref_wls, sample_ints, 'ro', markersize=6,
+        ax.plot(ref_wls, sample_ints, 'o', color=COLOURS['red'], markersize=6,
                 label=f'Reference peak positions ({len(ref_wls)})')
 
         for wl_r, si in zip(ref_wls, sample_ints):
             ax.annotate(f'{si:.1f}', (wl_r, si),
                         xytext=(4, 4), textcoords='offset points',
-                        fontsize=7, color='red', alpha=0.8)
+                        fontsize=7, color=COLOURS['red'], alpha=0.8)
 
         tv = data.get('Vibrational Temperature')
-        title = clean_name(sample_file)
+        label_text = clean_name(sample_file)
         if tv:
-            title += f'   (Tvib = {tv:.0f} K)'
-        ax.set_title(title)
+            label_text += f'   (Tvib = {tv:.0f} K)'
         ax.set_xlabel('Wavelength (nm)')
         ax.set_ylabel(y_label)
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8, frameon=False)
+        apply_thesis_style(ax)
+        # Add Tvib annotation as text inside plot instead of title
+        if tv:
+            ax.text(0.98, 0.95, f'Tvib = {tv:.0f} K',
+                    transform=ax.transAxes, ha='right', va='top',
+                    fontsize=9, color=COLOURS['grey'])
 
     plt.tight_layout()
     plt.show()
@@ -342,29 +366,30 @@ def plot_vib_temp_trends(results):
         return
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle('Vibrational Temperature Trends', fontsize=14)
 
     if power_pts:
         power_pts.sort()
         x, y = zip(*power_pts)
-        ax1.plot(x, y, 'bo-', linewidth=2, markersize=8)
+        ax1.plot(x, y, 'o-', color=COLOURS['blue'], linewidth=1.5, markersize=6)
         ax1.set_xlabel('Power (W)')
-        ax1.set_ylabel('Tvib (K)')
-        ax1.set_title('Tvib vs Power')
-        ax1.grid(True, alpha=0.3)
+        ax1.set_ylabel('$T_{vib}$ (K)')
+        apply_thesis_style(ax1)
     else:
-        ax1.text(0.5, 0.5, 'No Power (W) data in filenames', ha='center', va='center')
+        ax1.text(0.5, 0.5, 'No Power (W) data in filenames', ha='center', va='center',
+                 transform=ax1.transAxes)
+        apply_thesis_style(ax1)
 
     if pressure_pts:
         pressure_pts.sort()
         x, y = zip(*pressure_pts)
-        ax2.plot(x, y, 'ro-', linewidth=2, markersize=8)
+        ax2.plot(x, y, 'o-', color=COLOURS['red'], linewidth=1.5, markersize=6)
         ax2.set_xlabel('Pressure (mTorr)')
-        ax2.set_ylabel('Tvib (K)')
-        ax2.set_title('Tvib vs Pressure')
-        ax2.grid(True, alpha=0.3)
+        ax2.set_ylabel('$T_{vib}$ (K)')
+        apply_thesis_style(ax2)
     else:
-        ax2.text(0.5, 0.5, 'No Pressure (mTorr) data in filenames', ha='center', va='center')
+        ax2.text(0.5, 0.5, 'No Pressure (mTorr) data in filenames', ha='center', va='center',
+                 transform=ax2.transAxes)
+        apply_thesis_style(ax2)
 
     plt.tight_layout()
     plt.show()
@@ -419,24 +444,25 @@ def plot_pca(pca_data):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
     ax1.bar(range(1, len(pca_data['eigenvalues']) + 1),
-            pca_data['eigenvalues'], color='skyblue')
-    ax1.axhline(y=1, color='r', linestyle='--', label='Kaiser criterion (λ=1)')
-    ax1.set_title('Scree Plot')
+            pca_data['eigenvalues'], color=COLOURS['blue'], width=0.6)
+    ax1.axhline(y=1, color=COLOURS['red'], linestyle='--', linewidth=1,
+                label='Kaiser criterion (λ = 1)')
     ax1.set_xlabel('Principal Component')
     ax1.set_ylabel('Eigenvalue')
-    ax1.legend()
+    ax1.legend(frameon=False, fontsize=9)
+    apply_thesis_style(ax1)
 
     ax2.scatter(pca_data['transformed'][:, 0],
                 pca_data['transformed'][:, 1],
-                c='darkblue', s=100)
+                color=COLOURS['blue'], s=60, zorder=3)
+    # For trouble shooting
     for i, name in enumerate(pca_data['samples']):
-        ax2.annotate(name,
+     ax2.annotate(name,
                      (pca_data['transformed'][i, 0], pca_data['transformed'][i, 1]),
-                     fontsize=14)
-    ax2.set_title('PCA Score Plot (PC1 vs PC2)')
+                     fontsize=9, xytext=(5, 5), textcoords='offset points')
     ax2.set_xlabel(f"PC1 ({pca_data['explained_var'][0]:.1f}%)")
     ax2.set_ylabel(f"PC2 ({pca_data['explained_var'][1]:.1f}%)")
-    ax2.grid(True, alpha=0.3)
+    apply_thesis_style(ax2)
 
     plt.tight_layout()
     plt.show()
@@ -452,25 +478,16 @@ def main():
     print("=" * 60)
     print("Step 1: Select the reference peaks CSV produced by Part 1.")
 
-    root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)
-    try:
-        ref_csv = filedialog.askopenfilename(
-            title="Select Reference Peaks CSV (from Part 1)",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        )
-    finally:
-        root.destroy()
-
-    if not ref_csv:
-        print("No reference CSV selected. Exiting.")
+    if not os.path.isfile(REF_CSV):
+        print(f"Reference CSV not found:\n  {REF_CSV}")
         return
 
+
     try:
-        reference_peaks = load_reference_peaks_csv(ref_csv)
+        reference_peaks = load_reference_peaks_csv(REF_CSV)
     except Exception as e:
         print(f"Failed to load reference CSV: {e}")
         return
-
     print("\nStep 2: Select sample spectrum files to analyse.")
     root2 = tk.Tk(); root2.withdraw(); root2.attributes('-topmost', True)
     try:
@@ -488,7 +505,6 @@ def main():
     sample_files = list(sample_files)
     print(f"{len(sample_files)} sample file(s) selected.")
 
-    # Parameters
     print("\nAnalysis parameters")
     try:
         wavelength_tolerance = float(
@@ -499,12 +515,10 @@ def main():
         print(f"  {e} — using 0.1 nm tolerance.")
         wavelength_tolerance = 0.1
 
-    # ── Core analysis ─────────────────────────────────────────────────
     results = analyse_samples_against_reference_peaks(
         reference_peaks, sample_files, wavelength_tolerance
     )
 
-    # ── Save results ──────────────────────────────────────────────────
     save_q = (input("\nSave results to text file? (y/n) [y]: ").lower() or "y")
     if save_q.startswith('y'):
         root3 = tk.Tk(); root3.withdraw(); root3.attributes('-topmost', True)
@@ -520,13 +534,11 @@ def main():
             save_results(results, ref_csv, out_file)
             print(f"Results saved → {out_file}")
 
-    # ── Plots ─────────────────────────────────────────────────────────
     plot_q = (input("\nGenerate plots? (y/n) [y]: ").lower() or "y")
     if plot_q.startswith('y'):
         plot_sample_spectra(results)
         plot_vib_temp_trends(results)
 
-    # ── PCA ───────────────────────────────────────────────────────────
     pca_q = (input("\nRun PCA across samples? (y/n) [y]: ").lower() or "y")
     if pca_q.startswith('y'):
         pca_data = perform_pca(results)
