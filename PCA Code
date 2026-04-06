@@ -1,3 +1,5 @@
+from encodings import iso2022_jp_2004
+import math
 import numpy as np
 import scipy.signal
 import matplotlib.pyplot as plt
@@ -6,9 +8,34 @@ from tkinter import filedialog, messagebox
 import os
 import matplotlib.widgets as widgets
 import pandas as pd
+import re  # Imported to handle regex for file scanning
+#Data Collection
+def get_integration_time(filename):
 
+    base_name = os.path.basename(filename)
+    
+ 
+    match = re.search(r'(\d{2,3})ms', base_name)
+    
+    if match:
+        time_val = float(match.group(1))
+        return time_val
+    return None
+def extract_experiment_params(filename):
+    """Extracts Power (W) and Pressure (mTorr) from filename."""
+    base_name = os.path.basename(filename)
+    
+    # Regex for Power (e.g., "50W", "50.5 W")
+    power_match = re.search(r'(\d+\.?\d*)\s*W', base_name, re.IGNORECASE)
+    power = float(power_match.group(1)) if power_match else None
+    
+    # Regex for Pressure (e.g., "100mTorr", "100 mTorr")
+    pressure_match = re.search(r'(\d+\.?\d*)\s*mTorr', base_name, re.IGNORECASE)
+    pressure = float(pressure_match.group(1)) if pressure_match else None
+    
+    return power, pressure
 def load_oes_data(filename):
-    """Load OES data from various file formats including OceanView exports"""
+    
     try:
         # Try multiple methods to load the file
         methods = [
@@ -22,6 +49,7 @@ def load_oes_data(filename):
             lambda f: load_oes_data_manual(f)
         ]
         
+        data = None
         for i, method in enumerate(methods):
             try:
                 data = method(filename)
@@ -29,8 +57,9 @@ def load_oes_data(filename):
                 break
             except Exception as e:
                 continue
-        else:
-            raise ValueError("All loading methods failed")
+        
+        if data is None:
+             raise ValueError("All loading methods failed")
         
         if data.ndim == 1:
             wavelength = np.arange(len(data))
@@ -57,14 +86,14 @@ def load_oes_data(filename):
             return None, None
 
 def load_oes_data_manual(filename):
-    """Manual parsing for difficult OceanView files"""
+    #manual parsing
     wavelengths = []
     intensities = []
     
     with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
     
-    # Find data section
+    
     data_started = False
     for line in lines:
         line = line.strip()
@@ -73,7 +102,7 @@ def load_oes_data_manual(filename):
         if not line or any(keyword in line for keyword in ['Data', 'Wavelength', 'Intensity', 'nm', '#']):
             continue
         
-        # Try to split and parse numbers
+        # split and parse numbers
         parts = line.split()
         if len(parts) >= 2:
             try:
@@ -84,7 +113,7 @@ def load_oes_data_manual(filename):
                 data_started = True
             except ValueError:
                 if data_started:
-                    # If we already started data, this might be the end
+                 
                     break
                 continue
     
@@ -93,14 +122,14 @@ def load_oes_data_manual(filename):
     
     return np.array(wavelengths), np.array(intensities)
 
-def load_oes_data_simple(filename):
-    """Simplified loader that handles headers and non-numeric data"""
+def load_oes_data_simple(filename): #use this function to select files
+   
     try:
-        # Read all lines
+        
         with open(filename, 'r') as f:
             lines = f.readlines()
         
-        # Find where numeric data starts
+        # Start of Numbers
         data_lines = []
         for line in lines:
             line = line.strip()
@@ -116,11 +145,11 @@ def load_oes_data_simple(filename):
                     data_lines.append(line)
                 except ValueError:
                     continue  # Skip non-numeric lines
-        
+        #Hi :)
         if not data_lines:
             raise ValueError("No numeric data found")
         
-        # Parse the numeric data
+   
         data = []
         for line in data_lines:
             parts = line.split()
@@ -147,8 +176,7 @@ def load_oes_data_simple(filename):
         print(f"Error in simple loader for {filename}: {str(e)}")
         return None, None
 
-def clean_string_for_filename(filename):
-    """Clean string for filename display"""
+def clean_string_for_filename(filename):   #cleaning
     return os.path.basename(filename)
 
 def validate_parameters(min_height, min_distance, wavelength_tolerance):
@@ -161,32 +189,103 @@ def validate_parameters(min_height, min_distance, wavelength_tolerance):
         raise ValueError("Wavelength tolerance must be non-negative")
     return min_height, min_distance, wavelength_tolerance
 
-def estimate_detection_limits(intensity, noise_multiplier=3):
-    """Estimate detection limits based on noise level"""
-    # Use the first 50 points or 10% of data (whichever is smaller) for noise estimation
-    n_points = min(50, len(intensity) // 10)
-    if n_points < 5:
-        n_points = len(intensity) // 4
+#Scale detection with Noise- Good for testing
+# def estimate_detection_limits(intensity, noise_multiplier=3):
+   
+#     n_points = min(50, len(intensity) // 10)
+#     if n_points < 5:
+#         n_points = len(intensity) // 4
     
-    noise_std = np.std(intensity[:n_points])
-    return noise_multiplier * noise_std
+#     noise_std = np.std(intensity[:n_points])
+#     return noise_multiplier * noise_std
+def get_peak_intensity(wavelength_array, intensity_array, target_wl, tolerance=1.0):
+    
+    mask = (wavelength_array >= target_wl - tolerance) & (wavelength_array <= target_wl + tolerance)
+    
+    if not np.any(mask):
+        return 0.0 # Wavelength not found
+        
+    # Get the max intensity in that specific region
+    local_intensities = intensity_array[mask]
+    return np.max(local_intensities)
 
+def calculate_vibrational_temperature(wavelength, intensity):
+  
+    # 1. Get the intensity at the specific wavelengths
+    # We look within +/- 1.0 nm to account for spectrometer calibration shifts
+    I_00 = get_peak_intensity(wavelength, intensity, 337.13, tolerance=1.0)
+    I_10 = get_peak_intensity(wavelength, intensity, 315.93, tolerance=1.0)
+    
+    # 2. Check for bad data (avoid division by zero or log of zero)
+    if I_00 <= 0 or I_10 <= 0:
+        return None # Cannot calculate temp if peaks are missing
+        
+  
+    try:
+        # Numerator Term (Term 1)
+        term1 = I_00 * 0.388 * (337.13**4)
+        
+        # Denominator Term (Term 2)
+        term2 = I_10 * 0.449 * (315.93**4)
+        
+        # Calculate ratio
+        ratio = term1 / term2
+        
+        # Calculate Tvib
+        # Using ** for exponent, math.log for natural logarithm
+        Vt = 2012 /(0.695* math.log(ratio))
+        
+        return Vt
+        
+    except (ValueError, ZeroDivisionError):
+        return None
+    def graph_get_vibrational_temperature(wavelength, intensity):
+  
+    # 1. Get the intensity at the specific wavelengths
+    # We look within +/- 1.0 nm to account for spectrometer calibration shifts
+    I_00 = get_peak_intensity(wavelength, intensity, 337.13, tolerance=1.0)
+    I_10 = get_peak_intensity(wavelength, intensity, 315.93, tolerance=1.0)
+    I_20 = get_peak_intensity(wavelength, intensity, 337.13, tolerance=1.0)
+    I_30 = get_peak_intensity(wavelength, intensity, 337.13, tolerance=1.0)
+    I_40 = get_peak_intensity(wavelength, intensity, 337.13, tolerance=1.0)
+
+    # 2. Check for bad data (avoid division by zero or log of zero)
+    if I_00 <= 0 or I_10 <= 0:
+        return None # Cannot calculate temp if peaks are missing
+        
+  
+    try:
+        # Numerator Term (Term 1)
+        term1 = I_00 * 0.388 * (337.13**4)
+        
+        # Denominator Term (Term 2)
+        term2 = I_10 * 0.449 * (315.93**4)
+        
+        # Make graph Ln(Ivv/v^4q)
+        ratio = term1 / term2
+        
+        # Calculate Tvib
+        # slope = 1/kb Tvib
+        Vt = 1/m kb
+        
+        return Vt
+        
+    except (ValueError, ZeroDivisionError):
+        return None
 def normalize_spectrum(intensity, method='max'):
-    """Normalize spectrum intensity"""
+    
     if method == 'max':
         return intensity / np.max(intensity)
     elif method == 'area':
         return intensity / np.trapz(intensity)
     else:
         return intensity
-
+# Finds initial peaks seperate by a min distance.
 def find_oes_peaks(wavelength, intensity, min_height=5000, min_distance=10, prominence=None):
-    """
-    Identify peaks in OES data with automatic prominence estimation
-    """
-    # Auto-calculate prominence if not provided
-    if prominence is None:
-        prominence = estimate_detection_limits(intensity, noise_multiplier=5)
+   
+    
+    #if prominence is None:
+        #prominence = estimate_detection_limits(intensity, noise_multiplier=5)
     
     peaks, properties = scipy.signal.find_peaks(
         intensity, 
@@ -201,12 +300,10 @@ def find_oes_peaks(wavelength, intensity, min_height=5000, min_distance=10, prom
     
     return peak_wavelengths, peak_intensities, properties
 
+# This function does the actual wavelength scanning using the tolerance as a standard deviation.
 def get_intensity_at_wavelength(wavelength_array, intensity_array, target_wavelength, tolerance=0.1):
-    """
-    Get intensity value at or near a specific wavelength
-    Returns intensity at the closest wavelength point within tolerance
-    """
-    # Find the closest wavelength point
+    
+    
     wavelength_diffs = np.abs(wavelength_array - target_wavelength)
     min_diff_index = np.argmin(wavelength_diffs)
     min_diff = wavelength_diffs[min_diff_index]
@@ -217,10 +314,8 @@ def get_intensity_at_wavelength(wavelength_array, intensity_array, target_wavele
         return 0, min_diff  # Return 0 if no point within tolerance
 
 def analyze_multiple_spectra_at_reference_peaks(reference_file, sample_files, min_height=5000, min_distance=10, wavelength_tolerance=0.1):
-    """
-    Analyze multiple spectra at the peak positions found in reference spectrum
-    """
-    # Load reference data and find peaks
+    
+ 
     print(f"Loading reference spectrum: {clean_string_for_filename(reference_file)}")
     ref_wavelength, ref_intensity = load_oes_data_simple(reference_file)
     if ref_wavelength is None:
@@ -230,8 +325,19 @@ def analyze_multiple_spectra_at_reference_peaks(reference_file, sample_files, mi
     if ref_wavelength is None:
         print("Failed to load reference file with all methods")
         return None
+
+    # adjusting for int time
+    ref_int_time = get_integration_time(reference_file)
+    if ref_int_time:
+        print(f"Reference Integration Time found: {ref_int_time}ms. Normalizing intensity.")
+        ref_intensity = ref_intensity / ref_int_time
+       
+
+        print(f"NOTE: Intensities are now Counts/{ref_int_time}ms.")
+    else:
+        print("No integration time found in reference filename. Using raw counts.")
+
     
-    # Find peaks in reference spectrum
     ref_peak_wavelengths, ref_peak_intensities, _ = find_oes_peaks(
         ref_wavelength, ref_intensity, min_height, min_distance
     )
@@ -244,10 +350,11 @@ def analyze_multiple_spectra_at_reference_peaks(reference_file, sample_files, mi
         'reference_wavelength': ref_wavelength,
         'reference_intensity': ref_intensity,
         'reference_peaks': list(zip(ref_peak_wavelengths, ref_peak_intensities)),
+        'reference_time': ref_int_time,
         'sample_results': {}
     }
     
-    # Analyze each sample file
+  
     for sample_file in sample_files:
         print(f"Analyzing sample: {clean_string_for_filename(sample_file)}")
         sample_wavelength, sample_intensity = load_oes_data_simple(sample_file)
@@ -260,6 +367,14 @@ def analyze_multiple_spectra_at_reference_peaks(reference_file, sample_files, mi
             print(f"Error loading sample file: {sample_file}")
             continue
         
+        # Check for Sample Integration Time and Adjust
+        sample_int_time = get_integration_time(sample_file)
+        if sample_int_time:
+            print(f"Sample Integration Time found: {sample_int_time}ms. Adjusting intensity.")
+            sample_intensity = sample_intensity / sample_int_time
+        else:
+            print("No integration time found in sample filename. Using raw counts (WARNING: Comparisons may be inaccurate).")
+        t_vib = calculate_vibrational_temperature(sample_wavelength,sample_intensity)
         sample_peak_data = []
         
         # For each reference peak, find intensity in sample spectrum
@@ -278,22 +393,32 @@ def analyze_multiple_spectra_at_reference_peaks(reference_file, sample_files, mi
                 'intensity_ratio': intensity_ratio,
                 'wavelength_difference': wavelength_diff,
                 'within_tolerance': wavelength_diff <= wavelength_tolerance
+                
             })
         
         results['sample_results'][sample_file] = {
             'peak_data': sample_peak_data,
             'wavelength': sample_wavelength,
-            'intensity': sample_intensity
+            'intensity': sample_intensity,
+            'integration_time': sample_int_time,
+            "Vibrational Temperature": t_vib
         }
     
     return results
 
 def save_reference_peak_analysis(results, output_file):
-    """Save reference peak analysis results to file"""
+    #Save reference peak analysis results to file
     with open(output_file, 'w') as f:
         f.write("REFERENCE PEAK ANALYSIS RESULTS\n")
         f.write("=" * 60 + "\n")
         f.write(f"Reference file: {results['reference_file']}\n")
+        
+        if results.get('reference_time'):
+            f.write(f"Reference Integration Time: {results['reference_time']} ms\n")
+            f.write(f"NOTE: Intensities displayed are Counts per ms\n")
+        else:
+            f.write(f"Reference Integration Time: Not found\n")
+            
         f.write(f"Number of reference peaks: {len(results['reference_peaks'])}\n")
         f.write(f"Analysis date: {np.datetime64('now')}\n\n")
         
@@ -301,27 +426,38 @@ def save_reference_peak_analysis(results, output_file):
         f.write("REFERENCE PEAKS\n")
         f.write("-" * 60 + "\n")
         for i, (wl, inten) in enumerate(results['reference_peaks'], 1):
-            f.write(f"Peak {i}: Wavelength = {wl:.4f} nm, Intensity = {inten:.2f}\n")
+            f.write(f"Peak {i}: Wavelength = {wl:.4f} nm, Intensity = {inten:.4f}\n")
         f.write("\n")
         
-        # Write results for each sample
+        # Write results for each sample                          congrats for reading this far *\(^o^)/*
         for sample_file, sample_data in results['sample_results'].items():
             f.write(f"SAMPLE: {clean_string_for_filename(sample_file)}\n")
+            
+            s_time = sample_data.get('integration_time')
+            if s_time:
+                 f.write(f"Integration Time: {s_time} ms (Data normalized)\n")
+            else:
+                 f.write("Integration Time: Not found\n")
+            t_vib = sample_data.get("Vibrational Temperature")
+            if t_vib:
+                f.write(f"Vibrational Temperature: {t_vib:.2f} K\n")
+            else:
+                f.write("Vibrational Temperature: N/A (Peaks 337.1/315.9 nm missing)\n")
             f.write("-" * 60 + "\n")
             
             for i, peak in enumerate(sample_data['peak_data'], 1):
                 status = "✓" if peak['within_tolerance'] else "✗"
                 f.write(f"Peak {i}: {peak['wavelength']:.4f} nm {status}\n")
-                f.write(f"  Reference intensity: {peak['reference_intensity']:.2f}\n")
-                f.write(f"  Sample intensity:    {peak['sample_intensity']:.2f}\n")
+                f.write(f"  Reference intensity: {peak['reference_intensity']:.4f}\n")
+                f.write(f"  Sample intensity:    {peak['sample_intensity']:.4f}\n")
                 f.write(f"  Intensity ratio:     {peak['intensity_ratio']:.4f}\n")
                 f.write(f"  Wavelength diff:     {peak['wavelength_difference']:.4f} nm\n")
                 f.write(f"  Within tolerance:    {'Yes' if peak['within_tolerance'] else 'No'}\n\n")
             
             f.write("\n")
         
-        # Summary statistics
-        f.write("SUMMARY STATISTICS\n")
+        # Results
+        f.write("Summary\n")
         f.write("-" * 60 + "\n")
         for sample_file, sample_data in results['sample_results'].items():
             total_peaks = len(sample_data['peak_data'])
@@ -355,21 +491,23 @@ def plot_reference_peak_analysis(results):
     ref_peak_wls = [p[0] for p in ref_peaks]
     ref_peak_ints = [p[1] for p in ref_peaks]
     
+    y_label = 'Intensity/ms' if results.get('reference_time') else 'Intensity'
+    
     axes[0].plot(ref_wavelength, ref_intensity, 'b-', linewidth=1, label='Reference Spectrum')
     axes[0].plot(ref_peak_wls, ref_peak_ints, 'ro', markersize=6, label=f'Reference Peaks ({len(ref_peaks)})')
     axes[0].set_xlabel('Wavelength (nm)')
-    axes[0].set_ylabel('Intensity')
-    axes[0].set_title(f'Reference Spectrum: {clean_string_for_filename(results["reference_file"])}')
+    axes[0].set_ylabel(y_label)
+    axes[0].set_title(f'Reference: {clean_string_for_filename(results["reference_file"])}')
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
     
-    # Annotate reference peaks
+    # reference peaks
     for wl, inten in ref_peaks:
         axes[0].annotate(f'{wl:.1f}', (wl, inten), 
                         xytext=(5, 5), textcoords='offset points', 
                         fontsize=8, alpha=0.7)
     
-    # Plot sample spectra with reference peak positions
+    # Sample spectra with reference peak positions.
     for idx, (sample_file, sample_data) in enumerate(results['sample_results'].items(), 1):
         if idx >= len(axes):
             break
@@ -381,21 +519,23 @@ def plot_reference_peak_analysis(results):
         
         ax.plot(wavelength, intensity, 'g-', linewidth=1, label='Sample Spectrum')
         
-        # Plot reference peak positions on sample spectrum
+        # reference peak positions on sample spectrum.
         sample_ints = [p['sample_intensity'] for p in peak_data]
         ref_peak_wls = [p['wavelength'] for p in peak_data]
         ax.plot(ref_peak_wls, sample_ints, 'ro', markersize=6, 
                 label=f'Reference Peak Intensities ({len(ref_peak_wls)})')
         
+        s_y_label = 'Intensity/ms' if sample_data.get('integration_time') else 'Intensity'
+        
         ax.set_xlabel('Wavelength (nm)')
-        ax.set_ylabel('Intensity')
+        ax.set_ylabel(s_y_label)
         ax.set_title(f'Sample: {clean_string_for_filename(sample_file)}')
         ax.legend()
         ax.grid(True, alpha=0.3)
         
-        # Annotate intensities at reference peak positions
+        # intensities at reference peak positions
         for i, (wl, sample_int) in enumerate(zip(ref_peak_wls, sample_ints)):
-            ax.annotate(f'{sample_int:.0f}', (wl, sample_int), 
+            ax.annotate(f'{sample_int:.2f}', (wl, sample_int), 
                        xytext=(5, 5), textcoords='offset points', 
                        fontsize=8, alpha=0.7, color='red')
     
@@ -403,14 +543,14 @@ def plot_reference_peak_analysis(results):
     plt.show()
 
 def get_file_paths_dialog():
-    """Get file paths using tkinter dialog"""
+    
     root = tk.Tk()
     root.withdraw()
     root.attributes('-topmost', True)
     
     try:
         # Select reference file
-        print("Select REFERENCE OES spectrum file...")
+        print("Select REF OES spectrum file...")
         reference_file = filedialog.askopenfilename(
             title="Select Reference OES Spectrum",
             filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")]
@@ -421,7 +561,7 @@ def get_file_paths_dialog():
             return None, None
         
         # Select multiple sample files
-        print("Select SAMPLE OES spectrum files to analyze...")
+        print("Select SAMPLE spectrum files to analyze...")
         sample_files = filedialog.askopenfilenames(
             title="Select Sample OES Spectra",
             filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")]
@@ -441,12 +581,71 @@ def get_file_paths_dialog():
             root.destroy()
         except:
             pass
+def plot_vib_temp_trends(results):
+    """Plots Vibrational Temperature vs Power and Pressure."""
+    
+    # Lists to store data
+    power_data = []    # Stores (Power, Tvib)
+    pressure_data = [] # Stores (Pressure, Tvib)
+    
+    for filename, data in results['sample_results'].items():
+        t_vib = data.get("Vibrational Temperature")
+        
+        # Skip if temperature wasn't calculated
+        if t_vib is None:
+            continue
+            
+        # Extract parameters from filename
+        power, pressure = extract_experiment_params(filename)
+        
+        if power is not None:
+            power_data.append((power, t_vib))
+        if pressure is not None:
+            pressure_data.append((pressure, t_vib))
+    
+    # Sort data so lines connect properly (low to high)
+    power_data.sort(key=lambda x: x[0])
+    pressure_data.sort(key=lambda x: x[0])
+    
+    # Check plot data
+    if not power_data and not pressure_data:
+        print("No Power (W) or Pressure (mTorr) found in filenames to plot trends.")
+        return
 
+    # Create the figure
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle('Vibrational Temperature Trends', fontsize=16)
+    
+    # Plot Power Trend
+    if power_data:
+        x_val, y_val = zip(*power_data)
+        ax1.plot(x_val, y_val, 'bo-', linewidth=2, markersize=8)
+        ax1.set_xlabel('Power (W)')
+        ax1.set_ylabel('Vibrational Temperature (K)')
+        ax1.set_title('Temperature vs Power')
+        ax1.grid(True, alpha=0.3)
+    else:
+        ax1.text(0.5, 0.5, 'No Power Data (W) found', ha='center')
+
+    # Plot Pressure Trend
+    if pressure_data:
+        x_val, y_val = zip(*pressure_data)
+        ax2.plot(x_val, y_val, 'ro-', linewidth=2, markersize=8)
+        ax2.set_xlabel('Pressure (mTorr)')
+        ax2.set_ylabel('Vibrational Temperature (K)')
+        ax2.set_title('Temperature vs Pressure')
+        ax2.grid(True, alpha=0.3)
+    else:
+        ax2.text(0.5, 0.5, 'No Pressure Data (mTorr) found', ha='center')
+
+    plt.tight_layout()
+    plt.show()
 def reference_peak_analysis():
-    """Main function for reference peak analysis"""
+    
     print("\n=== REFERENCE PEAK ANALYSIS ===")
     print("This mode uses the first spectrum as reference and checks")
     print("intensities at reference peak positions in other spectra.")
+    print("It also scans filenames for integration time (e.g. '50ms') to normalize intensities.")
     
     # Get file paths
     reference_file, sample_files = get_file_paths_dialog()
@@ -460,7 +659,7 @@ def reference_peak_analysis():
     
     # Get analysis parameters
     try:
-        min_height = float(input("Enter minimum peak height for reference (default 5000): ") or "5000")
+        min_height = float(input("Enter minimum peak height (Note: Adjusts for int, this is counts/ms): ") or "50")
         min_distance = int(input("Enter minimum peak distance in data points (default 10): ") or "10")
         wavelength_tolerance = float(input("Enter wavelength tolerance for intensity lookup (default 0.1): ") or "0.1")
         
@@ -469,11 +668,11 @@ def reference_peak_analysis():
         )
     except ValueError as e:
         print(f"Parameter error: {e}. Using default parameters.")
-        min_height = 5000
+        min_height = 50
         min_distance = 10
         wavelength_tolerance = 0.1
     
-    # Perform analysis
+
     results = analyze_multiple_spectra_at_reference_peaks(
         reference_file, sample_files, min_height, min_distance, wavelength_tolerance
     )
@@ -482,20 +681,30 @@ def reference_peak_analysis():
         print("Analysis failed.")
         return
     
-    # Print results
+    
     print("\n" + "="*70)
     print("REFERENCE PEAK ANALYSIS RESULTS")
     print("="*70)
     
     print(f"\nReference: {clean_string_for_filename(reference_file)}")
+    if results.get('reference_time'):
+        print(f"Reference Integration Time: {results['reference_time']} ms (Intensities normalized)")
+    
     print(f"Found {len(results['reference_peaks'])} peaks in reference spectrum:")
     
     for i, (wl, inten) in enumerate(results['reference_peaks'], 1):
-        print(f"  {i}. {wl:.4f} nm (Intensity: {inten:.2f})")
+        print(f"  {i}. {wl:.4f} nm (Intensity: {inten:.4f})")
     
-    # Print results for each sample
+   
     for sample_file, sample_data in results['sample_results'].items():
         print(f"\n--- {clean_string_for_filename(sample_file)} ---")
+        if sample_data.get('integration_time'):
+            print(f"Integration Time: {sample_data['integration_time']} ms")
+        t_vib = sample_data.get("Vibrational Temperature")
+        if t_vib:
+            print(f"Vibrational Temperature: {t_vib:.2f} K")
+        else:
+            print("Vibrational Temperature: N/A")
         peak_data = sample_data['peak_data']
         
         peaks_in_tolerance = sum(1 for p in peak_data if p['within_tolerance'])
@@ -504,10 +713,10 @@ def reference_peak_analysis():
         for i, peak in enumerate(peak_data, 1):
             status = "✓" if peak['within_tolerance'] else "✗"
             print(f"  {i}. {peak['wavelength']:.4f} nm {status}")
-            print(f"     Ref: {peak['reference_intensity']:.2f}, Sample: {peak['sample_intensity']:.2f}")
+            print(f"     Ref: {peak['reference_intensity']:.4f}, Sample: {peak['sample_intensity']:.4f}")
             print(f"     Ratio: {peak['intensity_ratio']:.4f}, Wavelength diff: {peak['wavelength_difference']:.4f} nm")
     
-    # Ask to save results
+    # save results
     save_results = input("\nSave results to file? (y/n, default=y): ").lower() or "y"
     if save_results.startswith('y'):
         root = tk.Tk()
@@ -521,12 +730,11 @@ def reference_peak_analysis():
             save_reference_peak_analysis(results, output_file)
             print(f"Results saved to {output_file}")
     
-    # Ask to plot results
     plot_results = input("\nPlot results? (y/n, default=y): ").lower() or "y"
     if plot_results.startswith('y'):
         print("Generating plots...")
         plot_reference_peak_analysis(results)
-
+        plot_vib_temp_trends(results)
 def main():
     """Main function"""
     print("OES Spectrum Reference Peak Analysis Tool")
@@ -535,8 +743,9 @@ def main():
     print("identified in a reference spectrum.")
     
     reference_peak_analysis()
-    
+    #calculate_vibrational_temperature()
     print("\nAnalysis complete!")
 
 if __name__ == "__main__":
     main()
+#After 28 drafts and counting ...
