@@ -11,12 +11,16 @@ Features
 * Vibrational temperature (Tvib) via N2 C→B 0-0 / 1-0 band ratio
 * Trend plots: Tvib vs Power (W) and Tvib vs Pressure (mTorr)
 * PCA across all samples using the reference-peak intensities as features
+  - Score plot coloured by pressure, marker shape for argon %
+  - PC1 loadings bar chart to show which peaks drive separation
 * Full text results file export
 """
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import scipy.signal
@@ -28,10 +32,16 @@ import math
 
 
 # ─────────────────────────────────────────────
+#  PATH CONFIGURATION
+# ─────────────────────────────────────────────
+
+REF_CSV = r"c:\Users\User\oceanview\Nitrogen\Refrences\reference_peaks Nitro 30.csv"
+
+
+# ─────────────────────────────────────────────
 #  Plot style — publication quality
 # ─────────────────────────────────────────────
 
-# Muted colour palette
 COLOURS = {
     'blue':   '#4878CF',
     'red':    '#C44E52',
@@ -43,7 +53,6 @@ COLOURS = {
 }
 
 def apply_thesis_style(ax):
-    """Apply publication-quality styling to an axes object."""
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.spines['left'].set_linewidth(0.8)
@@ -55,21 +64,22 @@ def apply_thesis_style(ax):
 # ─────────────────────────────────────────────
 #  Utility helpers
 # ─────────────────────────────────────────────
-REF_CSV    = r"c:\Users\User\oceanview\Nitrogen\Refrences\reference_peaks Nitro 30.csv" 
+
 def get_integration_time(filename):
-    """Extracts integration time (ms) from filename, e.g. '50ms'."""
     match = re.search(r'(\d{2,3})ms', os.path.basename(filename))
     return float(match.group(1)) if match else None
 
 
 def extract_experiment_params(filename):
-    """Extracts Power (W) and Pressure (mTorr) from filename."""
+    """Extracts Power (W), Pressure (mTorr), and Argon % from filename."""
     base = os.path.basename(filename)
     power_m    = re.search(r'(\d+\.?\d*)\s*W',     base, re.IGNORECASE)
     pressure_m = re.search(r'(\d+\.?\d*)\s*mTorr', base, re.IGNORECASE)
+    argon_m    = re.search(r'argon(\d+\.?\d*)%',   base, re.IGNORECASE)
     power    = float(power_m.group(1))    if power_m    else None
     pressure = float(pressure_m.group(1)) if pressure_m else None
-    return power, pressure
+    argon    = float(argon_m.group(1))    if argon_m    else None
+    return power, pressure, argon
 
 
 def clean_name(filepath):
@@ -91,12 +101,7 @@ def validate_parameters(min_height, min_distance, wavelength_tolerance):
 # ─────────────────────────────────────────────
 
 def load_reference_peaks_csv(csv_file):
-    """
-    Loads the reference peaks CSV written by Part 1.
-    Returns list of (wavelength_nm, intensity_per_ms_or_raw) tuples.
-    """
     df = pd.read_csv(csv_file, comment='#', encoding='utf-8')
-
     required = {'wavelength_nm', 'intensity'}
     if not required.issubset(df.columns):
         raise ValueError(f"Reference CSV must contain columns: {required}. Found: {set(df.columns)}")
@@ -106,7 +111,7 @@ def load_reference_peaks_csv(csv_file):
         print("Using 'intensity_per_ms' column from reference CSV.")
     else:
         intensities = df['intensity'].values
-        print("Using raw 'intensity' column from reference CSV (no integration time was recorded).")
+        print("Using raw 'intensity' column from reference CSV.")
 
     peaks = list(zip(df['wavelength_nm'].values, intensities))
     print(f"Loaded {len(peaks)} reference peaks from {os.path.basename(csv_file)}")
@@ -114,7 +119,6 @@ def load_reference_peaks_csv(csv_file):
 
 
 def load_oes_data_simple(filename):
-    """Loads a sample OES spectrum (calibrated CSV or plain two-column text)."""
     try:
         with open(filename, 'r') as f:
             first_line = f.readline().strip()
@@ -173,10 +177,6 @@ def get_peak_intensity(wavelength_array, intensity_array, target_wl, tolerance=1
 # ─────────────────────────────────────────────
 
 def calculate_vibrational_temperature(wavelength, intensity, sample_name=""):
-    """
-    Tvib from N2 (C→B) 0-0 (337.13 nm) / 1-0 (315.93 nm) band ratio.
-    Returns (Tvib_K, None).
-    """
     I_00 = get_peak_intensity(wavelength, intensity, 337.13, tolerance=1.0)
     I_10 = get_peak_intensity(wavelength, intensity, 315.93, tolerance=1.0)
 
@@ -197,13 +197,9 @@ def calculate_vibrational_temperature(wavelength, intensity, sample_name=""):
 
 def analyse_samples_against_reference_peaks(reference_peaks, sample_files,
                                              wavelength_tolerance=0.1):
-    """
-    For each sample file, look up the intensity at every reference peak position.
-    Returns a results dict.
-    """
     results = {
         'reference_peaks': reference_peaks,
-        'sample_results': {},
+        'sample_results':  {},
     }
 
     for sample_file in sample_files:
@@ -211,7 +207,7 @@ def analyse_samples_against_reference_peaks(reference_peaks, sample_files,
         wavelength, intensity = load_oes_data_simple(sample_file)
 
         if wavelength is None:
-            print(f"  ✗ Could not load file — skipping.")
+            print(f"  Could not load file — skipping.")
             continue
 
         int_time = get_integration_time(sample_file)
@@ -230,19 +226,19 @@ def analyse_samples_against_reference_peaks(reference_peaks, sample_files,
                 wavelength, intensity, ref_wl, wavelength_tolerance
             )
             peak_data.append({
-                'wavelength':          ref_wl,
-                'reference_intensity': ref_int,
-                'sample_intensity':    sample_int,
-                'intensity_ratio':     sample_int / ref_int if ref_int > 0 else 0.0,
+                'wavelength':            ref_wl,
+                'reference_intensity':   ref_int,
+                'sample_intensity':      sample_int,
+                'intensity_ratio':       sample_int / ref_int if ref_int > 0 else 0.0,
                 'wavelength_difference': wl_diff,
-                'within_tolerance':    wl_diff <= wavelength_tolerance,
+                'within_tolerance':      wl_diff <= wavelength_tolerance,
             })
 
         results['sample_results'][sample_file] = {
-            'peak_data':             peak_data,
-            'wavelength':            wavelength,
-            'intensity':             intensity,
-            'integration_time':      int_time,
+            'peak_data':               peak_data,
+            'wavelength':              wavelength,
+            'intensity':               intensity,
+            'integration_time':        int_time,
             'Vibrational Temperature': t_vib,
         }
 
@@ -280,8 +276,8 @@ def save_results(results, reference_csv, output_file):
             f.write(f"  Tvib             : {tv:.2f} K\n\n" if tv else "  Tvib             : N/A\n\n")
 
             for i, p in enumerate(data['peak_data'], 1):
-                sym = "✓" if p['within_tolerance'] else "✗"
-                f.write(f"  Peak {i:3d}: {p['wavelength']:.4f} nm {sym}\n")
+                sym = "+" if p['within_tolerance'] else "-"
+                f.write(f"  Peak {i:3d}: {p['wavelength']:.4f} nm [{sym}]\n")
                 f.write(f"    Ref intensity    : {p['reference_intensity']:.4f}\n")
                 f.write(f"    Sample intensity : {p['sample_intensity']:.4f}\n")
                 f.write(f"    Ratio            : {p['intensity_ratio']:.4f}\n")
@@ -305,18 +301,16 @@ def save_results(results, reference_csv, output_file):
 # ─────────────────────────────────────────────
 
 def plot_sample_spectra(results):
-    """Overlay each sample spectrum with dots at reference peak positions."""
     n = len(results['sample_results'])
     if n == 0:
         return
 
     ref_wls = [p[0] for p in results['reference_peaks']]
-
     fig, axes = plt.subplots(n, 1, figsize=(13, 4 * n), squeeze=False)
 
     for ax, (sample_file, data) in zip(axes[:, 0], results['sample_results'].items()):
-        wl  = data['wavelength']
-        iny = data['intensity']
+        wl      = data['wavelength']
+        iny     = data['intensity']
         y_label = 'Intensity / ms' if data.get('integration_time') else 'Intensity'
 
         ax.plot(wl, iny, color=COLOURS['teal'], linewidth=0.8, label='Sample spectrum')
@@ -331,16 +325,12 @@ def plot_sample_spectra(results):
                         fontsize=7, color=COLOURS['red'], alpha=0.8)
 
         tv = data.get('Vibrational Temperature')
-        label_text = clean_name(sample_file)
-        if tv:
-            label_text += f'   (Tvib = {tv:.0f} K)'
         ax.set_xlabel('Wavelength (nm)')
         ax.set_ylabel(y_label)
         ax.legend(fontsize=8, frameon=False)
         apply_thesis_style(ax)
-        # Add Tvib annotation as text inside plot instead of title
         if tv:
-            ax.text(0.98, 0.95, f'Tvib = {tv:.0f} K',
+            ax.text(0.98, 0.95, f'$T_{{vib}}$ = {tv:.0f} K',
                     transform=ax.transAxes, ha='right', va='top',
                     fontsize=9, color=COLOURS['grey'])
 
@@ -349,7 +339,6 @@ def plot_sample_spectra(results):
 
 
 def plot_vib_temp_trends(results):
-    """Tvib vs Power and Tvib vs Pressure extracted from sample filenames."""
     power_pts    = []
     pressure_pts = []
 
@@ -357,7 +346,7 @@ def plot_vib_temp_trends(results):
         tv = data.get('Vibrational Temperature')
         if tv is None:
             continue
-        power, pressure = extract_experiment_params(filename)
+        power, pressure, _ = extract_experiment_params(filename)
         if power    is not None: power_pts.append((power, tv))
         if pressure is not None: pressure_pts.append((pressure, tv))
 
@@ -427,13 +416,23 @@ def perform_pca(results):
         tag = "SIGNIFICANT" if eig > 1.0 else "noise"
         print(f"  PC{i+1}: λ={eig:.3f}  ({var:.1f}%)  [{tag}]")
 
+    # Extract pressure and argon% per sample for colouring
+    pressures  = []
+    argon_pcts = []
+    for sample_file in results['sample_results'].keys():
+        _, pressure, argon = extract_experiment_params(sample_file)
+        pressures.append(pressure)
+        argon_pcts.append(argon)
+
     return {
-        'transformed': transformed,
-        'eigenvalues': eigenvalues,
+        'transformed':   transformed,
+        'eigenvalues':   eigenvalues,
         'explained_var': explained,
-        'loadings': pca.components_,
-        'labels': peak_labels,
-        'samples': sample_names,
+        'loadings':      pca.components_,
+        'labels':        peak_labels,
+        'samples':       sample_names,
+        'pressures':     pressures,
+        'argon_pcts':    argon_pcts,
     }
 
 
@@ -441,8 +440,13 @@ def plot_pca(pca_data):
     if pca_data is None:
         return
 
+    pressures  = pca_data['pressures']
+    argon_pcts = pca_data['argon_pcts']
+
+    # ── Figure 1: Scree + Score plot ──────────────────────────────────
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
+    # Scree plot
     ax1.bar(range(1, len(pca_data['eigenvalues']) + 1),
             pca_data['eigenvalues'], color=COLOURS['blue'], width=0.6)
     ax1.axhline(y=1, color=COLOURS['red'], linestyle='--', linewidth=1,
@@ -452,17 +456,72 @@ def plot_pca(pca_data):
     ax1.legend(frameon=False, fontsize=9)
     apply_thesis_style(ax1)
 
-    ax2.scatter(pca_data['transformed'][:, 0],
-                pca_data['transformed'][:, 1],
-                color=COLOURS['blue'], s=60, zorder=3)
-    # For trouble shooting
-    for i, name in enumerate(pca_data['samples']):
-     ax2.annotate(name,
-                     (pca_data['transformed'][i, 0], pca_data['transformed'][i, 1]),
-                     fontsize=9, xytext=(5, 5), textcoords='offset points')
+    # Score plot — colour by pressure, marker shape by argon %
+    valid_pressures = [p for p in pressures if p is not None]
+    pressure_norm   = mcolors.Normalize(
+        vmin=min(valid_pressures) * 0.8,
+        vmax=max(valid_pressures) * 1.1
+    ) if valid_pressures else mcolors.Normalize(0, 1)
+    pressure_cmap = plt.get_cmap('Blues')
+
+    unique_argons = sorted(set(a for a in argon_pcts if a is not None))
+    marker_map    = {a: m for a, m in zip(unique_argons, ['o', 's', '^', 'D', 'v'])}
+
+    for i in range(len(pca_data['samples'])):
+        p      = pressures[i]
+        arg    = argon_pcts[i]
+        colour = pressure_cmap(pressure_norm(p)) if p is not None else COLOURS['grey']
+        marker = marker_map.get(arg, 'o')
+
+        ax2.scatter(pca_data['transformed'][i, 0],
+                    pca_data['transformed'][i, 1],
+                    color=colour, marker=marker, s=70, zorder=3,
+                    edgecolors='#333333', linewidths=0.5)
+
     ax2.set_xlabel(f"PC1 ({pca_data['explained_var'][0]:.1f}%)")
     ax2.set_ylabel(f"PC2 ({pca_data['explained_var'][1]:.1f}%)")
     apply_thesis_style(ax2)
+
+    # Pressure colourbar
+    sm = cm.ScalarMappable(cmap='Blues', norm=pressure_norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax2, pad=0.02, shrink=0.8)
+    cbar.set_label('Pressure (mTorr)', fontsize=9)
+    cbar.ax.tick_params(labelsize=8, direction='in')
+    cbar.outline.set_linewidth(0.5)
+
+    # Argon % legend via marker shapes
+    if len(unique_argons) > 1:
+        handles = [
+            plt.scatter([], [], marker=marker_map[a], color='#888888',
+                        edgecolors='#333333', linewidths=0.5, s=50,
+                        label=f'Ar {a:.0f}%')
+            for a in unique_argons
+        ]
+        ax2.legend(handles=handles, frameon=False, fontsize=8,
+                   loc='lower right', title='Argon %', title_fontsize=8)
+
+    plt.tight_layout()
+    plt.show()
+
+    # ── Figure 2: PC1 loadings ────────────────────────────────────────
+    loadings = pca_data['loadings'][0]
+    labels   = pca_data['labels']
+    sort_idx = np.argsort(np.abs(loadings))[::-1]
+    top_n    = min(20, len(loadings))
+    idx      = sort_idx[:top_n]
+    top_load = loadings[idx]
+    top_labs = [labels[i] for i in idx]
+
+    fig2, ax3 = plt.subplots(figsize=(max(8, top_n * 0.55), 5))
+    bar_colours = [COLOURS['blue'] if v >= 0 else COLOURS['red'] for v in top_load]
+    ax3.bar(range(top_n), top_load, color=bar_colours, width=0.6)
+    ax3.set_xticks(range(top_n))
+    ax3.set_xticklabels(top_labs, rotation=45, ha='right', fontsize=8)
+    ax3.axhline(0, color='#333333', linewidth=0.6)
+    ax3.set_xlabel('Wavelength (nm)')
+    ax3.set_ylabel(f"PC1 loading ({pca_data['explained_var'][0]:.1f}%)")
+    apply_thesis_style(ax3)
 
     plt.tight_layout()
     plt.show()
@@ -476,27 +535,26 @@ def main():
     print("=" * 60)
     print("  Part 2 — Multi-Sample OES Analyser")
     print("=" * 60)
-    print("Step 1: Select the reference peaks CSV produced by Part 1.")
 
     if not os.path.isfile(REF_CSV):
         print(f"Reference CSV not found:\n  {REF_CSV}")
         return
-
 
     try:
         reference_peaks = load_reference_peaks_csv(REF_CSV)
     except Exception as e:
         print(f"Failed to load reference CSV: {e}")
         return
-    print("\nStep 2: Select sample spectrum files to analyse.")
-    root2 = tk.Tk(); root2.withdraw(); root2.attributes('-topmost', True)
+
+    print("\nSelect sample spectrum files to analyse.")
+    root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)
     try:
         sample_files = filedialog.askopenfilenames(
             title="Select Sample OES Spectra",
             filetypes=[("Text/CSV files", "*.txt *.csv"), ("All files", "*.*")],
         )
     finally:
-        root2.destroy()
+        root.destroy()
 
     if not sample_files:
         print("No sample files selected. Exiting.")
@@ -521,7 +579,7 @@ def main():
 
     save_q = (input("\nSave results to text file? (y/n) [y]: ").lower() or "y")
     if save_q.startswith('y'):
-        root3 = tk.Tk(); root3.withdraw(); root3.attributes('-topmost', True)
+        root2 = tk.Tk(); root2.withdraw(); root2.attributes('-topmost', True)
         try:
             out_file = filedialog.asksaveasfilename(
                 title="Save Analysis Results",
@@ -529,10 +587,10 @@ def main():
                 filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
             )
         finally:
-            root3.destroy()
+            root2.destroy()
         if out_file:
-            save_results(results, ref_csv, out_file)
-            print(f"Results saved → {out_file}")
+            save_results(results, REF_CSV, out_file)
+            print(f"Results saved -> {out_file}")
 
     plot_q = (input("\nGenerate plots? (y/n) [y]: ").lower() or "y")
     if plot_q.startswith('y'):
