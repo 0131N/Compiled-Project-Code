@@ -1,0 +1,630 @@
+"""
+Part 2 — Multi-Sample OES Analyser
+=====================================
+Loads the reference peaks CSV produced by Part 1, then compares any
+number of sample spectra against those peaks.
+
+Features
+--------
+* Intensity lookup at each reference peak position (with configurable tolerance)
+* Integration-time normalisation (reads "NNms" from filenames)
+* Vibrational temperature (Tvib) via N2 C→B 0-0 / 1-0 band ratio
+* Trend plots: Tvib vs Power (W) and Tvib vs Pressure (mTorr)
+* PCA across all samples using the reference-peak intensities as features
+  - Score plot coloured by Power (W) and shaped by Pressure (mTorr)
+  - PC1 loadings bar chart to show which peaks drive separation
+* Full text results file export
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+from matplotlib.lines import Line2D
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import scipy.signal
+import tkinter as tk
+from tkinter import filedialog
+import re
+import os
+import math
+
+
+# ─────────────────────────────────────────────
+#  PATH CONFIGURATION
+# ─────────────────────────────────────────────
+
+REF_CSV = r"c:\Users\User\oceanview\Nitrogen\Refrences\reference_peaks Nitro 30.csv"
+
+
+# ─────────────────────────────────────────────
+#  Plot style — publication quality
+# ─────────────────────────────────────────────
+
+COLOURS = {
+    'blue':   '#4878CF',
+    'red':    '#C44E52',
+    'green':  '#6ACC65',
+    'orange': '#D0732B',
+    'purple': '#8172B2',
+    'teal':   '#4DAFAA',
+    'grey':   '#555555',
+}
+
+def apply_thesis_style(ax):
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(0.8)
+    ax.spines['bottom'].set_linewidth(0.8)
+    ax.tick_params(axis='both', direction='in', length=4, width=0.8)
+    ax.grid(False)
+
+
+# ─────────────────────────────────────────────
+#  Utility helpers
+# ─────────────────────────────────────────────
+
+def get_integration_time(filename):
+    match = re.search(r'(\d{2,3})ms', os.path.basename(filename))
+    return float(match.group(1)) if match else None
+
+
+def extract_experiment_params(filename):
+    """Extracts Power (W) and Pressure (mTorr) from filename."""
+    base = os.path.basename(filename)
+    power_m    = re.search(r'(\d+\.?\d*)\s*W',     base, re.IGNORECASE)
+    pressure_m = re.search(r'(\d+\.?\d*)\s*mTorr', base, re.IGNORECASE)
+    power    = float(power_m.group(1))    if power_m    else None
+    pressure = float(pressure_m.group(1)) if pressure_m else None
+    return power, pressure
+
+
+def clean_name(filepath):
+    return os.path.basename(filepath)
+
+
+def validate_parameters(min_height, min_distance, wavelength_tolerance):
+    if min_height < 0:
+        raise ValueError("Minimum height must be non-negative")
+    if min_distance < 1:
+        raise ValueError("Minimum distance must be at least 1")
+    if wavelength_tolerance < 0:
+        raise ValueError("Wavelength tolerance must be non-negative")
+    return min_height, min_distance, wavelength_tolerance
+
+
+# ─────────────────────────────────────────────
+#  File loading
+# ─────────────────────────────────────────────
+
+def load_reference_peaks_csv(csv_file):
+    df = pd.read_csv(csv_file, comment='#', encoding='utf-8')
+    required = {'wavelength_nm', 'intensity'}
+    if not required.issubset(df.columns):
+        raise ValueError(f"Reference CSV must contain columns: {required}. Found: {set(df.columns)}")
+
+    if 'intensity_per_ms' in df.columns and df['intensity_per_ms'].notna().any():
+        intensities = df['intensity_per_ms'].values
+        print("Using 'intensity_per_ms' column from reference CSV.")
+    else:
+        intensities = df['intensity'].values
+        print("Using raw 'intensity' column from reference CSV.")
+
+    peaks = list(zip(df['wavelength_nm'].values, intensities))
+    print(f"Loaded {len(peaks)} reference peaks from {os.path.basename(csv_file)}")
+    return peaks
+
+
+def load_oes_data_simple(filename):
+    try:
+        with open(filename, 'r') as f:
+            first_line = f.readline().strip()
+
+        if 'wavelength_nm' in first_line and 'cal_intensity' in first_line:
+            df = pd.read_csv(filename)
+            return df['wavelength_nm'].values, df['cal_intensity'].values
+
+        with open(filename, 'r') as f:
+            lines = f.readlines()
+
+        data_lines = []
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                try:
+                    float(parts[0]); float(parts[1])
+                    data_lines.append(line.strip())
+                except ValueError:
+                    continue
+
+        if not data_lines:
+            raise ValueError("No numeric data found")
+
+        data = np.array([[float(p) for p in l.split()[:2]] for l in data_lines])
+        return data[:, 0], data[:, 1]
+
+    except Exception as e:
+        print(f"Error loading {filename}: {e}")
+        return None, None
+
+
+# ─────────────────────────────────────────────
+#  Intensity lookup
+# ─────────────────────────────────────────────
+
+def get_intensity_at_wavelength(wavelength_array, intensity_array,
+                                 target_wavelength, tolerance=0.1):
+    diffs = np.abs(wavelength_array - target_wavelength)
+    idx   = np.argmin(diffs)
+    if diffs[idx] <= tolerance:
+        return intensity_array[idx], diffs[idx]
+    return 0.0, diffs[idx]
+
+
+def get_peak_intensity(wavelength_array, intensity_array, target_wl, tolerance=1.0):
+    mask = ((wavelength_array >= target_wl - tolerance) &
+            (wavelength_array <= target_wl + tolerance))
+    if not np.any(mask):
+        return 0.0
+    return np.max(intensity_array[mask])
+
+
+# ─────────────────────────────────────────────
+#  Vibrational temperature
+# ─────────────────────────────────────────────
+
+def calculate_vibrational_temperature(wavelength, intensity, sample_name=""):
+    I_00 = get_peak_intensity(wavelength, intensity, 337.13, tolerance=1.0)
+    I_10 = get_peak_intensity(wavelength, intensity, 315.93, tolerance=1.0)
+
+    if I_00 <= 0 or I_10 <= 0:
+        return None, None
+
+    try:
+        ratio = (I_00 * 0.388 * 337.13**4) / (I_10 * 0.449 * 315.93**4)
+        Tvib  = 2012 / (0.695 * math.log(ratio))
+        return Tvib, None
+    except (ValueError, ZeroDivisionError):
+        return None, None
+
+
+# ─────────────────────────────────────────────
+#  Core analysis
+# ─────────────────────────────────────────────
+
+def analyse_samples_against_reference_peaks(reference_peaks, sample_files,
+                                             wavelength_tolerance=0.1):
+    results = {
+        'reference_peaks': reference_peaks,
+        'sample_results':  {},
+    }
+
+    for sample_file in sample_files:
+        print(f"\nAnalysing: {clean_name(sample_file)}")
+        wavelength, intensity = load_oes_data_simple(sample_file)
+
+        if wavelength is None:
+            print(f"  Could not load file — skipping.")
+            continue
+
+        int_time = get_integration_time(sample_file)
+        if int_time:
+            print(f"  Integration time: {int_time} ms — normalising.")
+            intensity = intensity / int_time
+        else:
+            print("  No integration time in filename — using raw counts.")
+
+        t_vib, _ = calculate_vibrational_temperature(wavelength, intensity,
+                                                     sample_name=clean_name(sample_file))
+
+        peak_data = []
+        for ref_wl, ref_int in reference_peaks:
+            sample_int, wl_diff = get_intensity_at_wavelength(
+                wavelength, intensity, ref_wl, wavelength_tolerance
+            )
+            peak_data.append({
+                'wavelength':            ref_wl,
+                'reference_intensity':   ref_int,
+                'sample_intensity':      sample_int,
+                'intensity_ratio':       sample_int / ref_int if ref_int > 0 else 0.0,
+                'wavelength_difference': wl_diff,
+                'within_tolerance':      wl_diff <= wavelength_tolerance,
+            })
+
+        results['sample_results'][sample_file] = {
+            'peak_data':               peak_data,
+            'wavelength':              wavelength,
+            'intensity':               intensity,
+            'integration_time':        int_time,
+            'Vibrational Temperature': t_vib,
+        }
+
+        in_tol = sum(1 for p in peak_data if p['within_tolerance'])
+        print(f"  Peaks matched within tolerance: {in_tol}/{len(peak_data)}")
+        if t_vib:
+            print(f"  Vibrational Temperature: {t_vib:.1f} K")
+
+    return results
+
+
+# ─────────────────────────────────────────────
+#  Saving results
+# ─────────────────────────────────────────────
+
+def save_results(results, reference_csv, output_file):
+    with open(output_file, 'w') as f:
+        f.write("MULTI-SAMPLE OES ANALYSIS — Part 2\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Reference peaks CSV : {reference_csv}\n")
+        f.write(f"Number of ref peaks : {len(results['reference_peaks'])}\n")
+        f.write(f"Analysis date       : {np.datetime64('now')}\n\n")
+
+        f.write("REFERENCE PEAKS\n")
+        f.write("-" * 60 + "\n")
+        for i, (wl, inten) in enumerate(results['reference_peaks'], 1):
+            f.write(f"  {i:3d}. {wl:.4f} nm   intensity = {inten:.4f}\n")
+        f.write("\n")
+
+        for sample_file, data in results['sample_results'].items():
+            f.write(f"SAMPLE: {clean_name(sample_file)}\n")
+            t = data.get('integration_time')
+            f.write(f"  Integration time : {t} ms\n" if t else "  Integration time : not found\n")
+            tv = data.get('Vibrational Temperature')
+            f.write(f"  Tvib             : {tv:.2f} K\n\n" if tv else "  Tvib             : N/A\n\n")
+
+            for i, p in enumerate(data['peak_data'], 1):
+                sym = "+" if p['within_tolerance'] else "-"
+                f.write(f"  Peak {i:3d}: {p['wavelength']:.4f} nm [{sym}]\n")
+                f.write(f"    Ref intensity    : {p['reference_intensity']:.4f}\n")
+                f.write(f"    Sample intensity : {p['sample_intensity']:.4f}\n")
+                f.write(f"    Ratio            : {p['intensity_ratio']:.4f}\n")
+                f.write(f"    Wavelength diff  : {p['wavelength_difference']:.4f} nm\n\n")
+
+        f.write("SUMMARY\n")
+        f.write("-" * 60 + "\n")
+        for sample_file, data in results['sample_results'].items():
+            total  = len(data['peak_data'])
+            in_tol = sum(1 for p in data['peak_data'] if p['within_tolerance'])
+            ratios = [p['intensity_ratio'] for p in data['peak_data']
+                      if p['within_tolerance'] and p['reference_intensity'] > 0]
+            avg_r  = np.mean(ratios) if ratios else 0
+            f.write(f"{clean_name(sample_file)}\n")
+            f.write(f"  Matched peaks : {in_tol}/{total} ({in_tol/total:.0%})\n")
+            f.write(f"  Avg ratio     : {avg_r:.4f}\n\n")
+
+
+# ─────────────────────────────────────────────
+#  Plotting
+# ─────────────────────────────────────────────
+
+def plot_sample_spectra(results):
+    n = len(results['sample_results'])
+    if n == 0:
+        return
+
+    ref_wls = [p[0] for p in results['reference_peaks']]
+    fig, axes = plt.subplots(n, 1, figsize=(13, 4 * n), squeeze=False)
+
+    for ax, (sample_file, data) in zip(axes[:, 0], results['sample_results'].items()):
+        wl      = data['wavelength']
+        iny     = data['intensity']
+        y_label = 'Intensity / ms' if data.get('integration_time') else 'Intensity'
+
+        ax.plot(wl, iny, color=COLOURS['teal'], linewidth=0.8, label='Sample spectrum')
+
+        sample_ints = [p['sample_intensity'] for p in data['peak_data']]
+        ax.plot(ref_wls, sample_ints, 'o', color=COLOURS['red'], markersize=6,
+                label=f'Reference peak positions ({len(ref_wls)})')
+
+        for wl_r, si in zip(ref_wls, sample_ints):
+            ax.annotate(f'{si:.1f}', (wl_r, si),
+                        xytext=(4, 4), textcoords='offset points',
+                        fontsize=7, color=COLOURS['red'], alpha=0.8)
+
+        tv = data.get('Vibrational Temperature')
+        ax.set_xlabel('Wavelength (nm)')
+        ax.set_ylabel(y_label)
+        ax.legend(fontsize=8, frameon=False)
+        apply_thesis_style(ax)
+        if tv:
+            ax.text(0.98, 0.95, f'$T_{{vib}}$ = {tv:.0f} K',
+                    transform=ax.transAxes, ha='right', va='top',
+                    fontsize=9, color=COLOURS['grey'])
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_vib_temp_trends(results):
+    power_pts    = []
+    pressure_pts = []
+
+    for filename, data in results['sample_results'].items():
+        tv = data.get('Vibrational Temperature')
+        if tv is None:
+            continue
+        power, pressure = extract_experiment_params(filename)
+        if power    is not None: power_pts.append((power, tv))
+        if pressure is not None: pressure_pts.append((pressure, tv))
+
+    if not power_pts and not pressure_pts:
+        print("No Power (W) or Pressure (mTorr) parameters found in filenames — skipping trend plot.")
+        return
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    if power_pts:
+        power_pts.sort()
+        x, y = zip(*power_pts)
+        ax1.plot(x, y, 'o-', color=COLOURS['blue'], linewidth=1.5, markersize=6)
+        ax1.set_xlabel('Power (W)')
+        ax1.set_ylabel('$T_{vib}$ (K)')
+        apply_thesis_style(ax1)
+    else:
+        ax1.text(0.5, 0.5, 'No Power (W) data in filenames', ha='center', va='center',
+                 transform=ax1.transAxes)
+        apply_thesis_style(ax1)
+
+    if pressure_pts:
+        pressure_pts.sort()
+        x, y = zip(*pressure_pts)
+        ax2.plot(x, y, 'o-', color=COLOURS['red'], linewidth=1.5, markersize=6)
+        ax2.set_xlabel('Pressure (mTorr)')
+        ax2.set_ylabel('$T_{vib}$ (K)')
+        apply_thesis_style(ax2)
+    else:
+        ax2.text(0.5, 0.5, 'No Pressure (mTorr) data in filenames', ha='center', va='center',
+                 transform=ax2.transAxes)
+        apply_thesis_style(ax2)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ─────────────────────────────────────────────
+#  PCA
+# ─────────────────────────────────────────────
+
+def perform_pca(results):
+    print("\n--- PCA on reference-peak intensities ---")
+    sample_names = []
+    data_matrix  = []
+
+    for sample_file, data in results['sample_results'].items():
+        sample_names.append(clean_name(sample_file))
+        data_matrix.append([p['sample_intensity'] for p in data['peak_data']])
+
+    if len(data_matrix) < 2:
+        print("Need at least 2 samples for PCA — skipping.")
+        return None
+
+    peak_labels = [f"{p[0]:.1f}nm" for p in results['reference_peaks']]
+    df_pca = pd.DataFrame(data_matrix, columns=peak_labels, index=sample_names)
+
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(df_pca)
+
+    pca = PCA()
+    transformed = pca.fit_transform(scaled)
+    eigenvalues  = pca.explained_variance_
+    explained    = pca.explained_variance_ratio_ * 100
+
+    for i, (eig, var) in enumerate(zip(eigenvalues, explained)):
+        tag = "SIGNIFICANT" if eig > 1.0 else "noise"
+        print(f"  PC{i+1}: λ={eig:.3f}  ({var:.1f}%)  [{tag}]")
+
+    # Extract power and pressure per sample
+    powers    = []
+    pressures = []
+    for sample_file in results['sample_results'].keys():
+        power, pressure = extract_experiment_params(sample_file)
+        powers.append(power)
+        pressures.append(pressure)
+
+    return {
+        'transformed':   transformed,
+        'eigenvalues':   eigenvalues,
+        'explained_var': explained,
+        'loadings':      pca.components_,
+        'labels':        peak_labels,
+        'samples':       sample_names,
+        'powers':        powers,
+        'pressures':     pressures,
+    }
+
+
+def plot_pca(pca_data):
+    if pca_data is None:
+        return
+
+    powers = pca_data['powers']
+    pressures = pca_data['pressures']  
+
+    # ── Figure 1: Scree + Score plot ──────────────────────────────────
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Scree plot
+    ax1.bar(range(1, len(pca_data['eigenvalues']) + 1),
+            pca_data['eigenvalues'], color=COLOURS['blue'], width=0.6)
+    ax1.axhline(y=1, color=COLOURS['red'], linestyle='--', linewidth=1,
+                label='Kaiser criterion (λ = 1)')
+    ax1.set_xlabel('Principal Component')
+    ax1.set_ylabel('Eigenvalue')
+    ax1.legend(frameon=False, fontsize=9)
+    apply_thesis_style(ax1)
+
+    # --- Set up Power Colors ---
+    valid_powers = [p for p in powers if p is not None]
+    power_norm   = mcolors.Normalize(
+        vmin=min(valid_powers) * 0.8,
+        vmax=max(valid_powers) * 1.1
+    ) if valid_powers else mcolors.Normalize(0, 1)
+    power_cmap = plt.get_cmap('plasma')
+
+    # --- Set up Pressure Markers ---
+    # Find all unique, valid pressures and sort them
+    valid_pressures = sorted(list(set([pr for pr in pressures if pr is not None])))
+    
+    # List of distinct, highly visible matplotlib markers
+    marker_list = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
+    
+    # Map each unique pressure to a marker shape
+    pressure_markers = {}
+    for idx, press in enumerate(valid_pressures):
+        pressure_markers[press] = marker_list[idx % len(marker_list)]
+
+    # Score plot — colour by power, shape by pressure
+    for i in range(len(pca_data['samples'])):
+        p      = powers[i]
+        press  = pressures[i]
+        
+        # Determine color (by power)
+        colour = power_cmap(power_norm(p)) if p is not None else COLOURS['grey']
+        
+        # Determine shape (by pressure), default to 'X' if pressure is unknown
+        m = pressure_markers.get(press, 'X') if press is not None else 'X'
+
+        ax2.scatter(pca_data['transformed'][i, 0],
+                    pca_data['transformed'][i, 1],
+                    color=colour, marker=m, s=70, zorder=3,
+                    edgecolors='#333333', linewidths=0.5)
+
+    ax2.set_xlabel(f"PC1 ({pca_data['explained_var'][0]:.1f}%)")
+    ax2.set_ylabel(f"PC2 ({pca_data['explained_var'][1]:.1f}%)")
+    apply_thesis_style(ax2)
+
+    # Power colourbar
+    sm = cm.ScalarMappable(cmap='plasma', norm=power_norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax2, pad=0.02, shrink=0.8)
+    cbar.set_label('Power (W)', fontsize=9)
+    cbar.ax.tick_params(labelsize=8, direction='in')
+    cbar.outline.set_linewidth(0.5)
+
+    # Pressure Shape Legend
+    if valid_pressures:
+        legend_elements = []
+        for press in valid_pressures:
+            m = pressure_markers[press]
+            legend_elements.append(
+                Line2D([0], [0], marker=m, color='w', label=f'{press} mTorr',
+                       markerfacecolor='grey', markersize=8, markeredgecolor='#333333')
+            )
+        # If there are unknown pressures, add an 'X' to the legend
+        if None in pressures:
+            legend_elements.append(
+                Line2D([0], [0], marker='X', color='w', label='Unknown',
+                       markerfacecolor='grey', markersize=8, markeredgecolor='#333333')
+            )
+            
+        ax2.legend(handles=legend_elements, title="Pressure",
+                   loc='best', frameon=False, fontsize=8, title_fontsize=9)
+
+    plt.tight_layout()
+    plt.show()
+
+    # ── Figure 2: PC1 loadings ────────────────────────────────────────
+    loadings = pca_data['loadings'][0]
+    labels   = pca_data['labels']
+    sort_idx = np.argsort(np.abs(loadings))[::-1]
+    top_n    = min(20, len(loadings))
+    idx      = sort_idx[:top_n]
+    top_load = loadings[idx]
+    top_labs = [labels[i] for i in idx]
+
+    fig2, ax3 = plt.subplots(figsize=(max(8, top_n * 0.55), 5))
+    bar_colours = [COLOURS['blue'] if v >= 0 else COLOURS['red'] for v in top_load]
+    ax3.bar(range(top_n), top_load, color=bar_colours, width=0.6)
+    ax3.set_xticks(range(top_n))
+    ax3.set_xticklabels(top_labs, rotation=45, ha='right', fontsize=8)
+    ax3.axhline(0, color='#333333', linewidth=0.6)
+    ax3.set_xlabel('Wavelength (nm)')
+    ax3.set_ylabel(f"PC1 loading ({pca_data['explained_var'][0]:.1f}%)")
+    apply_thesis_style(ax3)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ─────────────────────────────────────────────
+#  Main workflow
+# ─────────────────────────────────────────────
+
+def main():
+    print("=" * 60)
+    print("  Part 2 — Multi-Sample OES Analyser")
+    print("=" * 60)
+
+    if not os.path.isfile(REF_CSV):
+        print(f"Reference CSV not found:\n  {REF_CSV}")
+        return
+
+    try:
+        reference_peaks = load_reference_peaks_csv(REF_CSV)
+    except Exception as e:
+        print(f"Failed to load reference CSV: {e}")
+        return
+
+    print("\nSelect sample spectrum files to analyse.")
+    root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)
+    try:
+        sample_files = filedialog.askopenfilenames(
+            title="Select Sample OES Spectra",
+            filetypes=[("Text/CSV files", "*.txt *.csv"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+
+    if not sample_files:
+        print("No sample files selected. Exiting.")
+        return
+
+    sample_files = list(sample_files)
+    print(f"{len(sample_files)} sample file(s) selected.")
+
+    print("\nAnalysis parameters")
+    try:
+        wavelength_tolerance = float(
+            input("  Wavelength lookup tolerance in nm [default 0.1]: ") or "0.1"
+        )
+        wavelength_tolerance = validate_parameters(50, 10, wavelength_tolerance)[2]
+    except ValueError as e:
+        print(f"  {e} — using 0.1 nm tolerance.")
+        wavelength_tolerance = 0.1
+
+    results = analyse_samples_against_reference_peaks(
+        reference_peaks, sample_files, wavelength_tolerance
+    )
+
+    save_q = (input("\nSave results to text file? (y/n) [y]: ").lower() or "y")
+    if save_q.startswith('y'):
+        root2 = tk.Tk(); root2.withdraw(); root2.attributes('-topmost', True)
+        try:
+            out_file = filedialog.asksaveasfilename(
+                title="Save Analysis Results",
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            )
+        finally:
+            root2.destroy()
+        if out_file:
+            save_results(results, REF_CSV, out_file)
+            print(f"Results saved -> {out_file}")
+
+    plot_q = (input("\nGenerate plots? (y/n) [y]: ").lower() or "y")
+    if plot_q.startswith('y'):
+        plot_sample_spectra(results)
+        plot_vib_temp_trends(results)
+
+    pca_q = (input("\nRun PCA across samples? (y/n) [y]: ").lower() or "y")
+    if pca_q.startswith('y'):
+        pca_data = perform_pca(results)
+        plot_pca(pca_data)
+
+    print("\n✓ Analysis complete.")
+
+
+if __name__ == "__main__":
+    main()
