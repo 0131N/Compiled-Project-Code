@@ -30,13 +30,13 @@ from tkinter import filedialog
 import re
 import os
 import math
-
+from pc3_ratio_analysis import run_pc3_analysis 
 
 # ─────────────────────────────────────────────
 #  PATH CONFIGURATION
 # ─────────────────────────────────────────────
 
-REF_CSV = r"c:\Users\User\oceanview\Nitrogen\Refrences\reference_peaks Nitro 30.csv"
+REF_CSV = r"c:\Users\User\oceanview\Nitrogen\Refrences\Argon 9 percent 24 peaks10mTorr#.csv"
 
 
 # ─────────────────────────────────────────────
@@ -192,7 +192,6 @@ def calculate_vibrational_temperature(wavelength, intensity, sample_name=""):
         return Tvib, None
     except (ValueError, ZeroDivisionError):
         return None, None
-
 
 
 # ─────────────────────────────────────────────
@@ -457,8 +456,8 @@ def plot_pca(pca_data):
     fig1, ax1 = plt.subplots(figsize=(7, 5))
     ax1.bar(range(1, len(pca_data['eigenvalues']) + 1),
             pca_data['eigenvalues'], color=COLOURS['blue'], width=0.6)
-    ax1.axhline(y=1, color=COLOURS['red'], linestyle='--', linewidth=1,
-                label='Kaiser criterion (λ = 1)')
+    ax1.axhline(y=0.7, color=COLOURS['red'], linestyle='--', linewidth=1,
+                label='Kaiser criterion (λ = 0.7)')
     ax1.set_xlabel('Principal Component')
     ax1.set_ylabel('Eigenvalue')
     ax1.legend(frameon=False, fontsize=9)
@@ -529,33 +528,38 @@ def plot_pca(pca_data):
     plt.tight_layout()
     plt.show()
 
-    # ── Figure 3: PC3 score vs Argon % ───────────────────────────────
-    # Test for nonlinear (metastable pooling) signature:
-    # if pooling is active, expect a kink/threshold rather than linear trend
-    fig3, ax_pc3 = plt.subplots(figsize=(7, 5))
+    # ── Figure 3: PC3 score vs Argon % (per pressure group) ─────────
+    fig3, ax_pc3 = plt.subplots(figsize=(8, 5))
 
     pc3_scores = T[:, 2]
-    valid = [(a, s) for a, s in zip(argon_pcts, pc3_scores)]
-    valid.sort(key=lambda x: x[0])
-    x_ar = [v[0] for v in valid]
-    y_pc3 = [v[1] for v in valid]
 
-    # Scatter coloured by pressure
-    sc3 = ax_pc3.scatter(x_ar, y_pc3,
-                         c=[pressure_norm(p) if p is not None else 0 for p in pressures],
-                         cmap='plasma', s=70, zorder=3,
-                         edgecolors='#333333', linewidths=0.5)
+    # Group samples by pressure, draw one trend line per pressure level
+    pressure_groups = {}
+    for idx_s, (a, s, p) in enumerate(zip(argon_pcts, pc3_scores, pressures)):
+        key = round(p) if p is not None else 0
+        pressure_groups.setdefault(key, []).append((a, s, p))
 
-    # Light connecting line to reveal trend shape
-    ax_pc3.plot(x_ar, y_pc3, color=COLOURS['grey'], linewidth=0.8,
-                linestyle='--', zorder=2, alpha=0.5)
+    for pval, group in sorted(pressure_groups.items()):
+        group.sort(key=lambda x: x[0])   # sort by argon %
+        x_ar  = [g[0] for g in group]
+        y_pc3 = [g[1] for g in group]
+        p_raw = [g[2] for g in group]
+
+        line_colour = pressure_cmap(pressure_norm(pval))
+
+        # Trend line per pressure
+        ax_pc3.plot(x_ar, y_pc3, color=line_colour, linewidth=1.0,
+                    linestyle='--', zorder=2, alpha=0.7)
+
+        # Scatter points
+        ax_pc3.scatter(x_ar, y_pc3,
+                       c=[pressure_norm(p) for p in p_raw],
+                       cmap='plasma', s=70, zorder=3,
+                       edgecolors='#333333', linewidths=0.5,
+                       vmin=0, vmax=1)
 
     ax_pc3.set_xlabel('Argon concentration (%)')
     ax_pc3.set_ylabel(f"PC3 score ({pca_data['explained_var'][2]:.1f}%)")
-    ax_pc3.text(0.98, 0.98,
-                'Nonlinear trend suggests\nmetastable pooling threshold',
-                transform=ax_pc3.transAxes, ha='right', va='top',
-                fontsize=8, color=COLOURS['grey'], style='italic')
     apply_thesis_style(ax_pc3)
 
     sm3 = cm.ScalarMappable(cmap='plasma', norm=pressure_norm)
@@ -568,24 +572,31 @@ def plot_pca(pca_data):
     plt.tight_layout()
     plt.show()
 
-    # ── Figure 4: PC1 loadings ────────────────────────────────────────
-    loadings = pca_data['loadings'][0]
+    # ── Figure 4: PC1 and PC3 loadings side by side ───────────────────
     labels   = pca_data['labels']
-    sort_idx = np.argsort(np.abs(loadings))[::-1]
-    top_n    = min(20, len(loadings))
-    idx      = sort_idx[:top_n]
-    top_load = loadings[idx]
-    top_labs = [labels[i] for i in idx]
+    top_n    = min(20, len(labels))
 
-    fig2, ax3 = plt.subplots(figsize=(max(8, top_n * 0.55), 5))
-    bar_colours = [COLOURS['blue'] if v >= 0 else COLOURS['red'] for v in top_load]
-    ax3.bar(range(top_n), top_load, color=bar_colours, width=0.6)
-    ax3.set_xticks(range(top_n))
-    ax3.set_xticklabels(top_labs, rotation=45, ha='right', fontsize=8)
-    ax3.axhline(0, color='#333333', linewidth=0.6)
-    ax3.set_xlabel('Wavelength (nm)')
-    ax3.set_ylabel(f"PC1 loading ({pca_data['explained_var'][0]:.1f}%)")
-    apply_thesis_style(ax3)
+    fig4, (ax_l1, ax_l3) = plt.subplots(1, 2, figsize=(max(14, top_n * 1.1), 5))
+    # ax_l1 = PC2 loadings, ax_l3 = PC3 loadings
+
+    for ax_l, pc_idx, pc_label in [
+        (ax_l1, 1, 'PC2'),
+        (ax_l3, 2, 'PC3'),
+    ]:
+        loadings = pca_data['loadings'][pc_idx]
+        sort_idx = np.argsort(np.abs(loadings))[::-1]
+        idx      = sort_idx[:top_n]
+        top_load = loadings[idx]
+        top_labs = [labels[i] for i in idx]
+
+        bar_colours = [COLOURS['blue'] if v >= 0 else COLOURS['red'] for v in top_load]
+        ax_l.bar(range(top_n), top_load, color=bar_colours, width=0.6)
+        ax_l.set_xticks(range(top_n))
+        ax_l.set_xticklabels(top_labs, rotation=45, ha='right', fontsize=8)
+        ax_l.axhline(0, color='#333333', linewidth=0.6)
+        ax_l.set_xlabel('Wavelength (nm)')
+        ax_l.set_ylabel(f"{pc_label} loading ({pca_data['explained_var'][pc_idx]:.1f}%)")
+        apply_thesis_style(ax_l)
 
     plt.tight_layout()
     plt.show()
@@ -666,8 +677,12 @@ def main():
         pca_data = perform_pca(results)
         plot_pca(pca_data)
 
-    print("\n✓ Analysis complete.")
-
+        # ── PC3 vs predicted ratio analysis ──────────────────────
+        ratio_q = (input(
+            "\nRun PC3 vs predicted intensity ratio analysis? "
+            "(y/n) [y]: ").lower() or "y")
+        if ratio_q.startswith('y') and pca_data is not None:
+            run_pc3_analysis(pca_data)
 
 if __name__ == "__main__":
     main()
