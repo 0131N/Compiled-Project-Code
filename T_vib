@@ -1,0 +1,175 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+import os
+from scipy.stats import linregress
+
+# ─────────────────────────────────────────────
+#  Plot style — publication quality
+# ─────────────────────────────────────────────
+
+COLOURS = {
+    'blue':   '#4878CF',
+    'red':    '#C44E52',
+    'green':  '#6ACC65',
+    'orange': '#D0732B',
+    'purple': '#8172B2',
+    'teal':   '#4DAFAA',
+    'grey':   '#555555',
+    'black':  '#222222',
+}
+
+def apply_thesis_style(ax):
+    """Apply publication-quality styling to an axes object."""
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(0.8)
+    ax.spines['bottom'].set_linewidth(0.8)
+    ax.tick_params(axis='both', direction='in', length=4, width=0.8)
+    ax.grid(False)
+
+
+# ─────────────────────────────────────────────
+#  Peak definitions (N2 Second Positive System: C -> B)
+# ─────────────────────────────────────────────
+
+sps_peaks = [
+    {'v_prime': 0, 'v_double_prime': 2, 'wl': 380.4, 'q': 0.1462,  'E': 0},
+    {'v_prime': 1, 'v_double_prime': 3, 'wl': 375.4, 'q': 0.199,   'E': 2008},
+    {'v_prime': 2, 'v_double_prime': 4, 'wl': 370.9, 'q': 0.1605,  'E': 3969},
+    {'v_prime': 3, 'v_double_prime': 5, 'wl': 367.1, 'q': 0.09426, 'E': 5883},
+]
+
+
+def extract_experiment_params(filename):
+    """Extracts Power and Pressure from filename using robust regex."""
+    base_name = os.path.basename(filename)
+    power_match    = re.search(r'(\d+\.?\d*)\s*W',     base_name, re.IGNORECASE)
+    pressure_match = re.search(r'(\d+\.?\d*)\s*mTorr', base_name, re.IGNORECASE)
+    p  = float(power_match.group(1))    if power_match    else None
+    pr = float(pressure_match.group(1)) if pressure_match else None
+    return p, pr
+
+
+def calculate_vibrational_temperature(df):
+    """Calculates Tvib using a Boltzmann Plot of N2(C-B) transitions."""
+    x_data = []
+    y_data = []
+    k_cm   = 0.695  # Boltzmann constant in cm^-1/K
+
+    for peak in sps_peaks:
+        mask   = (df['wavelength_nm'] > peak['wl'] - 0.5) & (df['wavelength_nm'] < peak['wl'] + 0.5)
+        region = df[mask]
+
+        if not region.empty:
+            intensity = region['cal_intensity'].max()
+            if intensity > 0:
+                y_val = np.log((intensity * (peak['wl'] ** 4)) / peak['q'])
+                x_data.append(peak['E'])
+                y_data.append(y_val)
+
+    if len(x_data) > 1:
+        slope, intercept, r_value, p_value, std_err = linregress(x_data, y_data)
+        t_vib = -1 / (slope * k_cm)
+        return t_vib, r_value ** 2, slope, intercept, x_data, y_data
+
+    return None, None, None, None, None, None
+
+
+def process_and_plot(directory="."):
+    files = [f for f in os.listdir(directory) if f.endswith('.txt')]
+
+    if not files:
+        print("No .txt files found in the directory.")
+        return
+
+    power_trends    = {}
+    pressure_trends = {}
+
+    print(f"Found {len(files)} files. Starting analysis...")
+
+    for f in files:
+        power, pressure = extract_experiment_params(f)
+
+        if power is None or pressure is None:
+            print(f"Skipping {f}: Could not find Power or Pressure in name.")
+            continue
+
+        try:
+            df     = pd.read_csv(os.path.join(directory, f))
+            result = calculate_vibrational_temperature(df)
+            tvib, r2, slope, intercept, x_dat, y_dat = result
+
+            if tvib:
+                print(f"Analyzed {f}: Tvib = {tvib:.0f} K (R²={r2:.3f})")
+
+                # Boltzmann plot
+                fig, ax = plt.subplots(figsize=(8, 6))
+
+                ax.scatter(x_dat, y_dat,
+                           color=COLOURS['blue'], s=60, zorder=5,
+                           label='Experimental points')
+
+                x_line = np.linspace(min(x_dat), max(x_dat), 100)
+                y_line = slope * x_line + intercept
+                ax.plot(x_line, y_line,
+                        '--', color=COLOURS['red'], linewidth=1.5,
+                        label=f'Linear fit ($R^2$ = {r2:.3f})')
+
+                # Tvib annotation inside plot instead of title
+                ax.text(0.98, 0.95,
+                        f'$T_{{vib}}$ = {tvib:.0f} K',
+                        transform=ax.transAxes, ha='right', va='top',
+                        fontsize=10, color=COLOURS['grey'])
+
+                ax.set_xlabel('Energy $E$ (cm$^{-1}$)')
+                ax.set_ylabel('ln($I \cdot \lambda^4 / q$)')
+                ax.legend(frameon=False, fontsize=9)
+                apply_thesis_style(ax)
+                plt.tight_layout()
+                plt.show()
+
+                # Store for trends
+                if power not in power_trends:
+                    power_trends[power] = []
+                power_trends[power].append(tvib)
+
+                if pressure not in pressure_trends:
+                    pressure_trends[pressure] = []
+                pressure_trends[pressure].append(tvib)
+
+        except Exception as e:
+            print(f"Error processing {f}: {e}")
+
+    # Trend plots
+    if not power_trends and not pressure_trends:
+        print("No valid data found to plot trends.")
+        return
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    if power_trends:
+        p_sorted = sorted(power_trends.keys())
+        t_means  = [np.mean(power_trends[p]) for p in p_sorted]
+        ax1.plot(p_sorted, t_means, 'o-', color=COLOURS['red'],
+                 linewidth=1.5, markersize=5)
+        ax1.set_xlabel('Power (W)')
+        ax1.set_ylabel('$T_{vib}$ (K)')
+        apply_thesis_style(ax1)
+
+    if pressure_trends:
+        pr_sorted = sorted(pressure_trends.keys())
+        t_means   = [np.mean(pressure_trends[pr]) for pr in pr_sorted]
+        ax2.plot(pr_sorted, t_means, 'o-', color=COLOURS['blue'],
+                 linewidth=1.5, markersize=5)
+        ax2.set_xlabel('Pressure (mTorr)')
+        ax2.set_ylabel('$T_{vib}$ (K)')
+        apply_thesis_style(ax2)
+
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    process_and_plot(r"C:\Users\User\oceanview\Nitrogen\Corrected\pressure vs argon\31W")
