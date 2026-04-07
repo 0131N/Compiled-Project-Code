@@ -1,0 +1,337 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+import os
+import tkinter as tk
+from tkinter import filedialog, simpledialog, messagebox
+from scipy.stats import linregress, t as t_dist
+
+# ─────────────────────────────────────────────
+#  Plot style — publication quality
+# ─────────────────────────────────────────────
+
+COLOURS = {
+    'blue':   '#4878CF',
+    'red':    '#C44E52',
+    'green':  '#6ACC65',
+    'orange': '#D0732B',
+    'purple': '#8172B2',
+    'teal':   '#4DAFAA',
+    'grey':   '#555555',
+    'black':  '#222222',
+}
+
+LINE_COLOURS = [
+    '#4878CF', '#C44E52', '#6ACC65', '#D0732B',
+    '#8172B2', '#4DAFAA', '#222222', '#e377c2',
+]
+
+def apply_thesis_style(ax):
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(0.8)
+    ax.spines['bottom'].set_linewidth(0.8)
+    ax.tick_params(axis='both', direction='in', length=4, width=0.8)
+    ax.grid(False)
+
+
+# ─────────────────────────────────────────────
+#  Peak definitions (N2 Second Positive System: C -> B)
+# ─────────────────────────────────────────────
+
+sps_peaks = [
+    {'v_prime': 0, 'v_double_prime': 2, 'wl': 380.4, 'q': 0.1462,  'E': 0},
+    {'v_prime': 1, 'v_double_prime': 3, 'wl': 375.4, 'q': 0.199,   'E': 2008},
+    {'v_prime': 2, 'v_double_prime': 4, 'wl': 370.9, 'q': 0.1605,  'E': 3969},
+    {'v_prime': 3, 'v_double_prime': 5, 'wl': 367.1, 'q': 0.09426, 'E': 5883},
+]
+
+
+# ─────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────
+
+def extract_experiment_params(filename):
+    """Extracts Argon % and Pressure (mTorr) from filename.
+
+    Expects patterns like:
+        argon5%   /  argon 5%   /  Ar5%   /  Ar 5%   /  5%Ar   /  5% argon
+        30mTorr   /  30 mTorr
+    Pure nitrogen (no argon token) is recorded as 0 %.
+    """
+    base = os.path.basename(filename)
+
+    # Argon %: try several common naming conventions
+    argon_patterns = [
+        r'argon\s*(\d+\.?\d*)\s*%',   # argon5%  /  argon 5 %
+        r'ar\s*(\d+\.?\d*)\s*%',       # Ar5%     /  Ar 5%
+        r'(\d+\.?\d*)\s*%\s*ar',       # 5%Ar     /  5% Ar
+        r'(\d+\.?\d*)\s*%\s*argon',    # 5%argon
+    ]
+    argon = None
+    for pat in argon_patterns:
+        m = re.search(pat, base, re.IGNORECASE)
+        if m:
+            argon = float(m.group(1))
+            break
+    if argon is None:
+        argon = 0.0   # assume pure N2 if no argon token found
+
+    pressure_m = re.search(r'(\d+\.?\d*)\s*mTorr', base, re.IGNORECASE)
+    pressure   = float(pressure_m.group(1)) if pressure_m else None
+
+    return argon, pressure
+
+
+def calculate_vibrational_temperature(df):
+    x_data = []
+    y_data = []
+    k_cm   = 0.695
+
+    for peak in sps_peaks:
+        mask   = (df['wavelength_nm'] > peak['wl'] - 0.5) & (df['wavelength_nm'] < peak['wl'] + 0.5)
+        region = df[mask]
+        if not region.empty:
+            intensity = region['cal_intensity'].max()
+            if intensity > 0:
+                y_val = np.log((intensity * (peak['wl'] ** 4)) / peak['q'])
+                x_data.append(peak['E'])
+                y_data.append(y_val)
+
+    if len(x_data) > 1:
+        slope, intercept, r_value, p_value, std_err = linregress(x_data, y_data)
+        t_vib    = -1 / (slope * k_cm)
+        tvib_err = (t_vib ** 2) * k_cm * std_err
+        return t_vib, r_value ** 2, slope, intercept, x_data, y_data, std_err, tvib_err
+
+    return None, None, None, None, None, None, None, None
+
+
+# ─────────────────────────────────────────────
+#  Dialog helpers
+# ─────────────────────────────────────────────
+
+def ask_error_bar_method():
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    choice = messagebox.askquestion(
+        "Error Bar Method",
+        "How should error bars be calculated?\n\n"
+        "YES  →  Standard deviation of repeat measurements\n"
+        "         (use this if you have multiple spectra per condition)\n\n"
+        "NO   →  Propagated fit uncertainty from Boltzmann regression\n"
+        "         (use this if each condition has only one spectrum)\n",
+        icon='question'
+    )
+    root.destroy()
+    return 'repeat_std' if choice == 'yes' else 'fit_uncertainty'
+
+
+def ask_confidence_level():
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    answer = simpledialog.askstring(
+        "Confidence Level",
+        "Enter error bar confidence level:\n\n"
+        "  '1sigma'  →  ±1σ  (~68%)\n"
+        "  '2sigma'  →  ±2σ  (~95%)\n"
+        "  '95'      →  95% confidence interval\n\n"
+        "Default: 1sigma",
+        initialvalue="1sigma"
+    )
+    root.destroy()
+    return (answer or "1sigma").strip().lower()
+
+
+def select_files():
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    try:
+        selected = filedialog.askopenfilenames(
+            title="Select OES Spectrum Files",
+            filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+    return list(selected)
+
+
+def compute_error(tvib_values, tvib_errs, error_method, confidence):
+    if error_method == 'repeat_std' and len(tvib_values) > 1:
+        base_err = np.std(tvib_values, ddof=1)
+    else:
+        base_err = np.mean(tvib_errs) if tvib_errs else 0.0
+
+    if confidence == '2sigma':
+        return 2.0 * base_err
+    elif confidence == '95':
+        n     = max(len(tvib_values), 2)
+        t_val = t_dist.ppf(0.975, df=n - 1)
+        return t_val * base_err / np.sqrt(n)
+    else:
+        return base_err
+
+
+# ─────────────────────────────────────────────
+#  Main processing
+# ─────────────────────────────────────────────
+
+def process_and_plot(files, error_method, confidence):
+    if not files:
+        print("No files selected. Exiting.")
+        return
+
+    # data[argon_pct][pressure] = list of (tvib, tvib_err)
+    data = {}
+
+    print(f"\nSelected {len(files)} file(s). Starting analysis...")
+
+    for filepath in files:
+        f = os.path.basename(filepath)
+        argon, pressure = extract_experiment_params(filepath)
+
+        if pressure is None:
+            print(f"Skipping {f}: Could not find Pressure (mTorr) in filename.")
+            continue
+
+        try:
+            df = pd.read_csv(filepath)
+            result = calculate_vibrational_temperature(df)
+            tvib, r2, slope, intercept, x_dat, y_dat, slope_err, tvib_err = result
+
+            if tvib is None:
+                print(f"Skipping {f}: Could not calculate Tvib.")
+                continue
+
+            print(f"Analysed {f}:  Ar = {argon:.0f}%  |  Pressure = {pressure:.0f} mTorr  "
+                  f"|  Tvib = {tvib:.0f} K  ±{tvib_err:.0f} K  (R²={r2:.3f})")
+
+            if argon not in data:
+                data[argon] = {}
+            if pressure not in data[argon]:
+                data[argon][pressure] = []
+            data[argon][pressure].append((tvib, tvib_err))
+
+        except Exception as e:
+            print(f"Error processing {f}: {e}")
+
+    if not data:
+        print("No valid data found to plot trends.")
+        return
+
+    sorted_argons    = sorted(data.keys())
+    sorted_pressures = sorted({p for ad in data.values() for p in ad.keys()})
+
+    colour_map_ar = {ar: LINE_COLOURS[i % len(LINE_COLOURS)]
+                     for i, ar in enumerate(sorted_argons)}
+    colour_map_pr = {pr: LINE_COLOURS[i % len(LINE_COLOURS)]
+                     for i, pr in enumerate(sorted_pressures)}
+
+    # ── Plot 1: Tvib vs Argon % — one line per pressure ───────────────
+    fig1, ax1 = plt.subplots(figsize=(9, 6))
+
+    for pressure in sorted_pressures:
+        argons_with_data = sorted([ar for ar in sorted_argons if pressure in data[ar]])
+        if not argons_with_data:
+            continue
+
+        tvib_means, tvib_errs_plot = [], []
+        for argon in argons_with_data:
+            entries = data[argon][pressure]
+            tv_vals = [e[0] for e in entries]
+            tv_errs = [e[1] for e in entries]
+            tvib_means.append(np.mean(tv_vals))
+            tvib_errs_plot.append(compute_error(tv_vals, tv_errs, error_method, confidence))
+
+        ax1.errorbar(
+            argons_with_data, tvib_means,
+            yerr=tvib_errs_plot,
+            fmt='o-',
+            color=colour_map_pr[pressure],
+            linewidth=1.5, markersize=5,
+            capsize=4, capthick=0.8, elinewidth=0.8,
+            label=f'{pressure:.0f} mTorr',
+        )
+
+    ax1.set_xlabel('Argon Content (%)')
+    ax1.set_ylabel('$T_{vib}$ (K)')
+    ax1.legend(frameon=False, fontsize=9, title='Pressure', title_fontsize=9)
+    apply_thesis_style(ax1)
+    plt.tight_layout()
+    plt.show()
+
+    # ── Plot 2: Tvib vs Pressure — one line per argon % ───────────────
+    fig2, ax2 = plt.subplots(figsize=(9, 6))
+
+    for argon in sorted_argons:
+        pressures_with_data = sorted(data[argon].keys())
+        if not pressures_with_data:
+            continue
+
+        tvib_means, tvib_errs_plot = [], []
+        for pressure in pressures_with_data:
+            entries = data[argon][pressure]
+            tv_vals = [e[0] for e in entries]
+            tv_errs = [e[1] for e in entries]
+            tvib_means.append(np.mean(tv_vals))
+            tvib_errs_plot.append(compute_error(tv_vals, tv_errs, error_method, confidence))
+
+        label = f'Ar {argon:.0f}%' if argon > 0 else 'Pure N₂'
+        ax2.errorbar(
+            pressures_with_data, tvib_means,
+            yerr=tvib_errs_plot,
+            fmt='o-',
+            color=colour_map_ar[argon],
+            linewidth=1.5, markersize=5,
+            capsize=4, capthick=0.8, elinewidth=0.8,
+            label=label,
+        )
+
+    ax2.set_xlabel('Pressure (mTorr)')
+    ax2.set_ylabel('$T_{vib}$ (K)')
+    ax2.legend(frameon=False, fontsize=9, title='Argon %', title_fontsize=9)
+    apply_thesis_style(ax2)
+    plt.tight_layout()
+    plt.show()
+    for argon in sorted_argons:
+        for pressure in sorted(data[argon].keys()):
+            entries = data[argon][pressure]
+            tv_vals = [e[0] for e in entries]
+            tv_errs = [e[1] for e in entries]
+            
+            # Calculate mean and the chosen error
+            mean_val = np.mean(tv_vals)
+            final_err = compute_error(tv_vals, tv_errs, error_method, confidence)
+            
+            # Determine rounding (rounding to tens is usually best for ~5000K)
+            # This formats it as "5420 ± 150"
+            rounded_mean = int(round(mean_val, -1))
+            rounded_err  = int(round(final_err, -1))
+            
+            print(f"{argon:<8.1f} | {pressure:<8.0f} | {rounded_mean} ± {rounded_err} K")
+   
+print("\n--- FINAL WRITTEN MEASUREMENTS FOR THESIS ---")
+print(f"{'Ar %':<8} | {'Press':<8} | {'Result (Mean ± Error) [K]':<25}")
+print("-" * 50)
+
+    
+
+# ─────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    files = select_files()
+
+    if not files:
+        print("No files selected. Exiting.")
+    else:
+        error_method = ask_error_bar_method()
+        confidence   = ask_confidence_level()
+        print(f"\nError method : {error_method}")
+        print(f"Confidence   : {confidence}")
+        process_and_plot(files, error_method, confidence)
