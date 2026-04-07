@@ -27,6 +27,9 @@ LINE_COLOURS = [
     '#8172B2', '#4DAFAA', '#222222', '#e377c2',
 ]
 
+# ADDED: List of distinct markers for the plots
+MARKERS = ['o', 's', '^', 'D', 'v', 'p', '*', 'h']
+
 def apply_thesis_style(ax):
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
@@ -162,19 +165,19 @@ def compute_error(values, error_method, confidence):
     else:
         return base_err
 
-
+# UPDATED: Added `marker` argument, removed `fmt='o-'` in favor of explicit kwargs
 def plot_te_and_ne(ax_te, ax_ne, x_values, te_means, te_errs,
-                   ne_means, ne_errs, colour, label):
+                   ne_means, ne_errs, colour, marker, label):
     ax_te.errorbar(
         x_values, te_means, yerr=te_errs,
-        fmt='o-', color=colour,
+        color=colour, marker=marker, linestyle='-',
         linewidth=1.5, markersize=5,
         capsize=4, capthick=0.8, elinewidth=0.8,
         label=label,
     )
     ax_ne.errorbar(
         x_values, ne_means, yerr=ne_errs,
-        fmt='o-', color=colour,
+        color=colour, marker=marker, linestyle='-',
         linewidth=1.5, markersize=5,
         capsize=4, capthick=0.8, elinewidth=0.8,
         label=label,
@@ -216,9 +219,6 @@ def process_and_plot(files, error_method, confidence):
             print(f"    Power={power:.4g} W  |  Pressure={pressure:.4g} mTorr  |  "
                   f"ratio={ratio:.3f}  Te={t_e:.2f} eV  ne(rel)={ne_rel:.2e}")
 
-            # Individual spectrum plot
-
-
             # Store
             if pressure not in data:
                 data[pressure] = {}
@@ -237,14 +237,16 @@ def process_and_plot(files, error_method, confidence):
     sorted_pressures = sorted(data.keys())
     sorted_powers    = sorted({pw for pd_ in data.values() for pw in pd_.keys()})
 
-    colour_map_pr = {p:  LINE_COLOURS[i % len(LINE_COLOURS)]
-                     for i, p  in enumerate(sorted_pressures)}
-    colour_map_pw = {pw: LINE_COLOURS[i % len(LINE_COLOURS)]
-                     for i, pw in enumerate(sorted_powers)}
+    colour_map_pr = {p:  LINE_COLOURS[i % len(LINE_COLOURS)] for i, p  in enumerate(sorted_pressures)}
+    colour_map_pw = {pw: LINE_COLOURS[i % len(LINE_COLOURS)] for i, pw in enumerate(sorted_powers)}
+    
+    # ADDED: Map specific markers to pressures and powers
+    marker_map_pr = {p:  MARKERS[i % len(MARKERS)] for i, p  in enumerate(sorted_pressures)}
+    marker_map_pw = {pw: MARKERS[i % len(MARKERS)] for i, pw in enumerate(sorted_powers)}
 
     # ════════════════════════════════════════════════════════════════
     #  Figure 1 — Te vs Power  &  ne vs Power
-    #             one coloured line per pressure
+    #             one coloured/shaped line per pressure
     # ════════════════════════════════════════════════════════════════
     fig1, (ax1_te, ax1_ne) = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -262,12 +264,14 @@ def process_and_plot(files, error_method, confidence):
             ne_means.append(np.mean(nv))
             ne_errs.append(compute_error(nv, error_method, confidence))
 
+        # UPDATED: Passing the mapped marker
         plot_te_and_ne(
             ax1_te, ax1_ne,
             powers_with_pressure,
             te_means, te_errs,
             ne_means, ne_errs,
             colour=colour_map_pr[pressure],
+            marker=marker_map_pr[pressure],
             label=f'{pressure:.0f} mTorr',
         )
 
@@ -286,7 +290,7 @@ def process_and_plot(files, error_method, confidence):
 
     # ════════════════════════════════════════════════════════════════
     #  Figure 2 — Te vs Pressure  &  ne vs Pressure
-    #             one coloured line per power
+    #             one coloured/shaped line per power
     # ════════════════════════════════════════════════════════════════
     fig2, (ax2_te, ax2_ne) = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -305,12 +309,14 @@ def process_and_plot(files, error_method, confidence):
             ne_means.append(np.mean(nv))
             ne_errs.append(compute_error(nv, error_method, confidence))
 
+        # UPDATED: Passing the mapped marker
         plot_te_and_ne(
             ax2_te, ax2_ne,
             pressures_with_power,
             te_means, te_errs,
             ne_means, ne_errs,
             colour=colour_map_pw[power],
+            marker=marker_map_pw[power],
             label=f'{power:.0f} W',
         )
 
