@@ -1,0 +1,190 @@
+"""
+Hydrogen Contamination — Relative Intensity Tracker
+=====================================================
+Selects a folder of OES spectra, extracts the Hβ (434.1 nm) intensity
+relative to the dominant SPS (337 nm) line for every file, and plots
+the ratio against each experimental parameter parsed from the filename.
+
+Filename format expected (same as thesis pipeline):
+    ..._<power>W_<pressure>mTorr_<flow>sccm_argon<X>%_<int>ms.txt
+"""
+
+import os
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import matplotlib.cm as cm
+import tkinter as tk
+from tkinter import filedialog
+
+
+# ─────────────────────────────────────────────
+#  Configuration
+# ─────────────────────────────────────────────
+
+H_BETA_WL  = 434.1   # nm  Hβ Balmer line
+SPS_REF_WL = 336.9   # nm  SPS (0,0) reference line
+TOLERANCE  = 1.0     # nm  window around each target wavelength
+
+COLOURS = {
+    'blue':  '#4878CF',
+    'red':   '#C44E52',
+    'grey':  '#555555',
+}
+
+def apply_thesis_style(ax):
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(0.8)
+    ax.spines['bottom'].set_linewidth(0.8)
+    ax.tick_params(axis='both', direction='in', length=4, width=0.8)
+    ax.grid(False)
+
+
+# ─────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────
+
+def select_folder():
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    folder = filedialog.askdirectory(title="Select folder containing OES spectra")
+    root.destroy()
+    return folder
+
+
+def get_spectrum_files(folder):
+    exts = ('.txt', '.csv')
+    return [os.path.join(folder, f)
+            for f in sorted(os.listdir(folder))
+            if f.lower().endswith(exts)]
+
+
+def parse_params(filename):
+    base = os.path.basename(filename)
+    def extract(pattern):
+        m = re.search(pattern, base, re.IGNORECASE)
+        return float(m.group(1)) if m else None
+    return {
+        'power':    extract(r'(\d+\.?\d*)\s*W'),
+        'pressure': extract(r'(\d+\.?\d*)\s*mTorr'),
+        'flow':     extract(r'(\d+\.?\d*)\s*sccm'),
+        'argon':    extract(r'argon(\d+\.?\d*)%'),
+        'int_time': extract(r'(\d{2,4})ms'),
+    }
+
+
+def load_spectrum(filepath):
+    try:
+        with open(filepath, 'r') as f:
+            first = f.readline().strip()
+        if 'wavelength_nm' in first:
+            import pandas as pd
+            df = pd.read_csv(filepath)
+            col = 'cal_intensity' if 'cal_intensity' in df.columns else df.columns[1]
+            return df['wavelength_nm'].values, df[col].values
+        data = np.loadtxt(filepath, comments=['#', '>'], usecols=(0, 1))
+        return data[:, 0], data[:, 1]
+    except Exception:
+        return None, None
+
+
+def peak_intensity(wl, intensity, target, tol=TOLERANCE):
+    mask = (wl >= target - tol) & (wl <= target + tol)
+    return float(np.max(intensity[mask])) if np.any(mask) else None
+
+
+# ─────────────────────────────────────────────
+#  Main
+# ─────────────────────────────────────────────
+
+def main():
+    folder = select_folder()
+    if not folder:
+        print("No folder selected — exiting.")
+        return
+
+    files = get_spectrum_files(folder)
+    if not files:
+        print(f"No .txt/.csv files found in {folder}")
+        return
+    print(f"Found {len(files)} spectrum files in {folder}")
+
+    records = []
+    for fp in files:
+        wl, inten = load_spectrum(fp)
+        if wl is None:
+            print(f"  [SKIP] Could not load {os.path.basename(fp)}")
+            continue
+
+        params = parse_params(fp)
+
+        # Normalise by integration time if available
+        if params['int_time']:
+            inten = inten / params['int_time']
+
+        i_hbeta = peak_intensity(wl, inten, H_BETA_WL)
+        i_sps   = peak_intensity(wl, inten, SPS_REF_WL)
+
+        if i_hbeta is None or i_sps is None or i_sps == 0:
+            print(f"  [SKIP] Target peaks not found in {os.path.basename(fp)}")
+            continue
+
+        ratio = i_hbeta / i_sps
+        records.append({**params, 'i_hbeta': i_hbeta, 'i_sps': i_sps, 'ratio': ratio})
+        print(f"  {os.path.basename(fp):50s}  "
+              f"Hβ/SPS = {ratio:.4f}  "
+              f"Hβ = {i_hbeta:.1f}")
+
+    if not records:
+        print("No valid spectra processed — exiting.")
+        return
+
+    print(f"\nProcessed {len(records)} spectra successfully.")
+
+    # ── Plotting ──────────────────────────────────────────────────────
+    param_cfg = [
+        ('pressure', 'Pressure (mTorr)'),
+        ('flow',     'Flow Rate (sccm)'),
+        ('power',    'Power (W)'),
+        ('argon',    'Argon Concentration (%)'),
+    ]
+
+    # Only plot parameters that have at least 2 distinct values
+    active = [(col, label) for col, label in param_cfg
+              if len(set(r[col] for r in records if r[col] is not None)) >= 2]
+
+    if not active:
+        print("Insufficient parameter variation to plot — check filenames.")
+        return
+
+    n_plots = len(active)
+    fig, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 4.5), squeeze=False)
+
+    for ax, (col, xlabel) in zip(axes[0], active):
+        x = [r[col]   for r in records if r[col] is not None]
+        y = [r['ratio'] for r in records if r[col] is not None]
+
+        ax.scatter(x, y, color=COLOURS['blue'], s=40,
+                   edgecolors='#333333', linewidths=0.4, zorder=3)
+
+        # Regression line
+        coeffs = np.polyfit(x, y, 1)
+        x_line = np.linspace(min(x), max(x), 100)
+        ax.plot(x_line, np.polyval(coeffs, x_line),
+                color=COLOURS['red'], linewidth=1.4, linestyle='--', zorder=2)
+
+        ax.set_xlabel(xlabel, fontsize=10)
+        ax.set_ylabel(r'$I_{H\beta}$ / $I_{SPS(337)}$'
+                      if col == active[0][0] else '', fontsize=10)
+        apply_thesis_style(ax)
+
+
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == '__main__':
+    main()
