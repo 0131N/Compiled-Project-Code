@@ -1,0 +1,447 @@
+"""
+OES Intensity Ratio Discontinuity Test
+=======================================
+Detects alpha-to-gamma discharge mode transitions via the
+FNS/SPS ratio I(391 nm) / I(337 nm) as a function of power.
+
+FNS (391.4 nm, N2+): requires > 18.8 eV   — gamma-enhanced
+SPS (337.1 nm, N2 ): requires > 11.03 eV  — alpha-regime
+
+Usage: run standalone; select OES files when prompted.
+
+Expected filename format (from Ocean Optics export):
+  timestamp_pressure_power_flowrate_integtime_gastype__spec__idx__time_cal.txt
+  e.g. 1774027193136_10mTorr_48W_40sccm_700ms_argon2__FLMT002291__0__16-56-35-377_cal.txt
+
+Power   : extracted from e.g. "48W" in filename
+Pressure: extracted from e.g. "10mTorr" or "10mtorr"
+Argon % : extracted from e.g. "argon2" (2%), "argon" (unknown %), or absent (pure N2)
+Int time: extracted from e.g. "700ms" in filename
+Ramp    : add "rampup" / "rampdown" to filename to enable hysteresis plot
+"""
+
+import re, os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
+from scipy.stats import linregress
+import tkinter as tk
+from tkinter import filedialog
+
+# ── Constants ────────────────────────────────────────────────────────────────
+FNS_TARGET, SPS_TARGET, TOLERANCE   = 391.4, 337.1, 1.5
+DERIVATIVE_THRESHOLD                = 2.0   # std-devs above mean
+
+C_PURE  = '#4878CF'
+C_ARGON = '#C44E52'
+C_DERIV = '#6ACC65'
+C_FIT1  = '#888888'
+C_FIT2  = '#D0732B'
+C_TRANS = '#C44E52'
+
+plt.rcParams.update({'font.size': 10, 'font.family': 'serif'})
+
+
+# ── Plot style ───────────────────────────────────────────────────────────────
+def thesis_ax(ax):
+    for sp in ['top', 'right']:
+        ax.spines[sp].set_visible(False)
+    for sp in ['left', 'bottom']:
+        ax.spines[sp].set_linewidth(0.8)
+    ax.tick_params(axis='both', direction='in', length=4, width=0.8)
+    ax.grid(False)
+
+
+# ── File I/O ─────────────────────────────────────────────────────────────────
+def load_spectrum(fp):
+    """Return (wavelength, intensity) arrays or (None, None)."""
+    try:
+        with open(fp, 'r', errors='replace') as f:
+            lines = f.readlines()
+
+        # Ocean Optics FLAME-T
+        for i, l in enumerate(lines):
+            if '>>>>>Begin Spectral Data<<<<<' in l:
+                data = [ln.replace(',', '.').split()
+                        for ln in lines[i+1:] if ln.strip()]
+                data = [(float(r[0]), float(r[1]))
+                        for r in data if len(r) >= 2]
+                if data:
+                    arr = np.array(data)
+                    return arr[:, 0], arr[:, 1]
+                return None, None
+
+        # Calibrated CSV
+        if lines and 'wavelength_nm' in lines[0] and 'cal_intensity' in lines[0]:
+            df = pd.read_csv(fp)
+            return df['wavelength_nm'].values, df['cal_intensity'].values
+
+        # Plain two-column text
+        data = []
+        for ln in lines:
+            p = ln.strip().split()
+            try:
+                if len(p) >= 2:
+                    data.append((float(p[0]), float(p[1])))
+            except ValueError:
+                continue
+        if data:
+            arr = np.array(data)
+            return arr[:, 0], arr[:, 1]
+
+    except Exception as e:
+        print(f"  Could not load {os.path.basename(fp)}: {e}")
+    return None, None
+
+
+def get_integration_time(fp):
+    """
+    Return integration time in ms.
+    Checks Ocean Optics header first, then filename (e.g. '700ms').
+    """
+    try:
+        with open(fp, 'r', errors='replace') as f:
+            for line in f:
+                if 'Integration Time' in line and 'sec' in line.lower():
+                    tail = line.split(':', 1)[-1] if ':' in line else line.split('\t', 1)[-1]
+                    m = re.search(r'[-+]?\d*\.?\d+[eE][-+]?\d+|[-+]?\d+\.?\d*', tail)
+                    if m:
+                        return float(m.group()) * 1000.0
+                if '>>>>>Begin Spectral Data<<<<<' in line:
+                    break
+    except Exception:
+        pass
+    # Filename fallback — matches "700ms", "70ms", "1000ms" etc.
+    m = re.search(r'[\s_](\d{2,5})ms(?:[\s_]|$|__)', os.path.basename(fp), re.IGNORECASE)
+    return float(m.group(1)) if m else None
+
+
+def parse_filename(fp):
+    """
+    Extract (power_W, pressure_str, argon_pct, ramp_direction) from filename.
+    Handles mixed formats with underscores, spaces, or varied field order.
+
+    Examples handled:
+      1774027193136_10mTorr_48W_40sccm_700ms_argon2__FLMT002291__0__..._cal.txt
+      210W 33mTorr 10sccm_FLMT002291__0__12-55-57-184_cal.txt
+      1774028533186_Nitro_agron_41mTorr_175W_FLMT002291__0__14-57-38-303.txt
+      280W 33mTorr 10sccm_FLMT002291__1__12-57-21-681_cal.txt
+    """
+    base = os.path.basename(fp).lower()
+
+    # Power: 1-4 digit number followed by 'w', bounded by space/underscore/dot/start
+    # This avoids matching the 13-digit unix timestamp or sccm flow values
+    m_pow = re.search(r'(?:^|[\s_])(\d{1,4}\.?\d*)\s*w(?=[\s_\.]|$)', base)
+    power = float(m_pow.group(1)) if m_pow else None
+
+    # Pressure: number + unit, bounded so 'torr' inside 'mtorr' doesn't double-match
+    m_pres = re.search(r'(\d+\.?\d*)\s*(mtorr|torr|mbar|bar|pa)(?=[\s_\.]|$)', base)
+    pressure = f"{m_pres.group(1)}{m_pres.group(2)}" if m_pres else 'unknown'
+
+    # Argon: 'argon2'/'agron2' -> 2.0%;  'argon'/'agron' alone -> -1.0 (present, unknown %)
+    m_ar = re.search(r'(?:argon|agron)(\d+\.?\d*)', base)
+    if m_ar and m_ar.group(1):
+        argon = float(m_ar.group(1))
+    elif 'argon' in base or 'agron' in base:
+        argon = -1.0
+    else:
+        argon = 0.0
+
+    # Ramp direction
+    if any(k in base for k in ['rampup', 'up_ramp', '_up_', 'upramp']):
+        ramp = 'up'
+    elif any(k in base for k in ['rampdown', 'down_ramp', '_down_', 'downramp']):
+        ramp = 'down'
+    else:
+        ramp = 'unknown'
+
+    return power, pressure, argon, ramp
+
+
+def peak_intensity(wl, inten, target, tol=TOLERANCE):
+    """Max intensity within [target ± tol] nm."""
+    mask = (wl >= target - tol) & (wl <= target + tol)
+    if not np.any(mask):
+        return None, None
+    idx = np.argmax(inten[mask])
+    return float(inten[mask][idx]), float(wl[mask][idx])
+
+
+# ── Ratio extraction ─────────────────────────────────────────────────────────
+def extract_ratios(filepaths, normalise=True):
+    """Process OES files → list of record dicts sorted by power."""
+    records, skipped = [], []
+    for fp in filepaths:
+        fname = os.path.basename(fp)
+        print(f"  {fname}")
+        wl, inten = load_spectrum(fp)
+        if wl is None:
+            skipped.append(fname); continue
+
+        if normalise:
+            t = get_integration_time(fp)
+            if t is None:
+                print("    SKIPPED — integration time not found"); skipped.append(fname); continue
+            inten = inten / t
+            print(f"    Normalised by {t:.1f} ms")
+
+        power, pressure, argon, ramp = parse_filename(fp)
+        if power is None:
+            print("    SKIPPED — no power in filename"); skipped.append(fname); continue
+
+        I_fns, wl_fns = peak_intensity(wl, inten, FNS_TARGET)
+        I_sps, wl_sps = peak_intensity(wl, inten, SPS_TARGET)
+        if I_fns is None or I_sps is None or I_sps <= 0:
+            print("    SKIPPED — FNS or SPS peak not found"); skipped.append(fname); continue
+
+        ratio = I_fns / I_sps
+        print(f"    {power:.0f}W {pressure} | FNS={I_fns:.2f} | SPS={I_sps:.2f} | ratio={ratio:.4f} | Ar={argon}%")
+        records.append(dict(power=power, pressure=pressure, ratio=ratio,
+                            I_fns=I_fns, I_sps=I_sps,
+                            fns_wl=wl_fns, sps_wl=wl_sps,
+                            argon_pct=argon, ramp_direction=ramp, filename=fname))
+
+    if skipped:
+        print(f"\n  Skipped ({len(skipped)}): {', '.join(skipped)}")
+    return sorted(records, key=lambda r: r['power'])
+
+
+# ── Transition detection ─────────────────────────────────────────────────────
+def detect_transition(powers, ratios, smooth_window=5):
+    """Detect a discontinuity in ratio vs power via derivative + piecewise fit."""
+    powers, ratios = np.array(powers, float), np.array(ratios, float)
+    if len(powers) < 5:
+        print("  Too few points."); return None
+
+    df = (pd.DataFrame({'power': powers, 'ratio': ratios})
+          .groupby('power', as_index=False)
+          .agg(ratio=('ratio', 'mean'), count=('ratio', 'count')))
+    pu, ru = df['power'].values, df['ratio'].values
+    n = len(pu)
+    if n < 4:
+        print("  Need ≥ 4 unique power levels."); return None
+
+    wlen  = max(3, min(smooth_window, n if n % 2 else n - 1))
+    smooth = savgol_filter(ru, wlen, 2)
+    dP    = np.gradient(pu)
+    deriv = np.where(dP != 0, np.gradient(smooth) / dP, np.nan)
+
+    thr     = np.nanmean(np.abs(deriv)) + DERIVATIVE_THRESHOLD * np.nanstd(np.abs(deriv))
+    flagged = np.where(np.abs(deriv) > thr)[0]
+    t_pow   = float(pu[flagged[0]]) if len(flagged) else None
+
+    best_r2, best_bp, best_bpr = -np.inf, None, None
+    for i in range(2, n - 2):
+        x1, y1, x2, y2 = pu[:i], ru[:i], pu[i:], ru[i:]
+        if len(np.unique(x1)) < 2 or len(np.unique(x2)) < 2:
+            continue
+        _, _, r1, _, _ = linregress(x1, y1)
+        _, _, r2, _, _ = linregress(x2, y2)
+        combined = (len(x1) * r1**2 + len(x2) * r2**2) / n
+        if combined > best_r2:
+            best_r2, best_bp, best_bpr = combined, float(pu[i]), float(ru[i])
+
+    _, _, r_lin, _, _ = linregress(pu, ru)
+    delta = best_r2 - r_lin**2 if best_bp is not None else 0
+
+    print(f"  Derivative transition: {t_pow} W | "
+          f"Breakpoint: {best_bp} W | "
+          f"ΔR²={delta:.4f} ({'transition likely' if delta > 0.05 else 'weak evidence'})")
+
+    return dict(powers_unique=pu, ratios_unique=ru, smooth_ratios=smooth,
+                derivative=deriv, threshold=thr,
+                transition_power=t_pow, breakpoint_power=best_bp,
+                breakpoint_ratio=best_bpr, r2_piecewise=best_r2, r2_linear=r_lin**2)
+
+
+# ── Four separate plots ───────────────────────────────────────────────────────
+def _unpack(records):
+    keys = ['power', 'ratio', 'I_fns', 'I_sps']
+    return tuple(np.array([r[k] for r in records]) for k in keys)
+
+
+def plot_ratio(records_pure, records_argon, disc):
+    fig, ax = plt.subplots(figsize=(7, 5))
+    pows_p, ratios_p, *_ = _unpack(records_pure)
+
+    ax.scatter(pows_p, ratios_p, color=C_PURE, s=60, zorder=4,
+               edgecolors='#222222', linewidths=0.5, label='Pure N$_2$')
+    if disc:
+        ax.plot(disc['powers_unique'], disc['ratios_unique'],
+                '-', color=C_PURE, lw=1.5, alpha=0.7, zorder=3, label='Mean ratio')
+    if records_argon:
+        pows_a, ratios_a, *_ = _unpack(records_argon)
+        ax.scatter(pows_a, ratios_a, color=C_ARGON, s=60, marker='s', zorder=4,
+                   edgecolors='#222222', linewidths=0.5, label='N$_2$ + Ar')
+    if disc and disc['breakpoint_power']:
+        ax.axvline(disc['breakpoint_power'], color=C_TRANS, lw=1.8, ls='--', zorder=2,
+                   label=f"Breakpoint ~{disc['breakpoint_power']:.0f} W")
+        ax.scatter([disc['breakpoint_power']], [disc['breakpoint_ratio']],
+                   color=C_TRANS, s=120, zorder=5, edgecolors='#222222', lw=0.8)
+
+    ax.set_xlabel('Power (W)')
+    ax.set_ylabel('$I_{391}\\,/\\,I_{337}$  (FNS / SPS)')
+    ax.legend(frameon=False, fontsize=8)
+    thesis_ax(ax)
+    fig.tight_layout()
+    fig.savefig('plot1_ratio_vs_power.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+def plot_raw_intensities(records_pure, disc):
+    fig, ax = plt.subplots(figsize=(7, 5))
+    pows_p, _, ifns_p, isps_p = _unpack(records_pure)
+
+    ax.scatter(pows_p, ifns_p, color='#C44E52', s=50, zorder=4,
+               edgecolors='#222222', lw=0.4, label='$I_{391}$ FNS (N$_2^+$)')
+    ax.scatter(pows_p, isps_p, color='#4878CF', s=50, marker='s', zorder=4,
+               edgecolors='#222222', lw=0.4, label='$I_{337}$ SPS (N$_2$)')
+
+    if disc:
+        for col, arr in [('#C44E52', ifns_p), ('#4878CF', isps_p)]:
+            df = pd.DataFrame({'power': pows_p, 'I': arr}).groupby('power')['I'].mean()
+            ax.plot(df.index, df.values, '-', color=col, lw=1.2, alpha=0.6)
+        if disc['breakpoint_power']:
+            ax.axvline(disc['breakpoint_power'], color=C_TRANS, lw=1.2, ls='--', alpha=0.5)
+
+    ax.set_xlabel('Power (W)')
+    ax.set_ylabel('Intensity (counts / ms)')
+    ax.legend(frameon=False, fontsize=8)
+    thesis_ax(ax)
+    fig.tight_layout()
+    fig.savefig('plot2_raw_intensities.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+
+
+def plot_piecewise(records_pure, disc):
+    if not disc or not disc['breakpoint_power']:
+        return
+    fig, ax = plt.subplots(figsize=(7, 5))
+    pows_p, ratios_p, *_ = _unpack(records_pure)
+    pu, ru = disc['powers_unique'], disc['ratios_unique']
+    bp     = disc['breakpoint_power']
+    bp_idx = int(np.clip(np.searchsorted(pu, bp), 2, len(pu) - 2))
+
+    ax.scatter(pows_p, ratios_p, color=C_PURE, s=55, zorder=3,
+               edgecolors='#222222', lw=0.5, label='Raw data')
+
+    for x, y, lbl in [
+        (pu[:bp_idx], ru[:bp_idx], 'Segment 1'),
+        (pu[bp_idx:], ru[bp_idx:], 'Segment 2'),
+    ]:
+        if len(np.unique(x)) >= 2:
+            m, c, *_ = linregress(x, y)
+            xf = np.linspace(x[0], x[-1], 100)
+            fc = C_FIT1 if lbl == 'Segment 1' else C_FIT2
+            ax.plot(xf, m * xf + c, color=fc, lw=2.2, zorder=4, label=f'{lbl} fit')
+
+    ax.axvline(bp, color=C_TRANS, lw=1.8, ls='--', zorder=5,
+               label=(f'Breakpoint {bp:.0f} W  '
+                      f'$R^2_{{pw}}$={disc["r2_piecewise"]:.3f}  '
+                      f'$R^2_{{lin}}$={disc["r2_linear"]:.3f}'))
+
+    ax.set_xlabel('Power (W)')
+    ax.set_ylabel('$I_{391}\\,/\\,I_{337}$')
+    ax.legend(frameon=False, fontsize=7.5)
+    thesis_ax(ax)
+    fig.tight_layout()
+    fig.savefig('plot4_piecewise.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+def plot_hysteresis(records_up, records_down):
+    if not records_up or not records_down:
+        print("  Need both up and down ramp files."); return
+    fig, ax = plt.subplots(figsize=(7, 5))
+    pu = np.array([r['power'] for r in records_up])
+    ru = np.array([r['ratio'] for r in records_up])
+    pd_ = np.array([r['power'] for r in records_down])
+    rd  = np.array([r['ratio'] for r in records_down])
+
+    ax.plot(pu, ru, 'o-', color=C_PURE, lw=1.5, ms=6,
+            markeredgecolor='#222222', mew=0.5, label='Ramp up $\\uparrow$')
+    ax.plot(pd_, rd, 's--', color=C_ARGON, lw=1.5, ms=6,
+            markeredgecolor='#222222', mew=0.5, label='Ramp down $\\downarrow$')
+
+    common = np.intersect1d(np.round(pu), np.round(pd_))
+    if len(common) > 1:
+        ax.fill_between(common,
+                        np.interp(common, pu, ru),
+                        np.interp(common, pd_, rd),
+                        alpha=0.15, color='#C44E52', label='Hysteresis region')
+
+    ax.set_xlabel('Power (W)')
+    ax.set_ylabel('$I_{391}\\,/\\,I_{337}$  (FNS / SPS)')
+    ax.legend(frameon=False, fontsize=9)
+    thesis_ax(ax)
+    fig.tight_layout()
+    fig.savefig('plot5_hysteresis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    print("=" * 60)
+    print("  OES Intensity Ratio — Alpha-to-Gamma Transition Test")
+    print(f"  FNS: {FNS_TARGET} nm (18.8 eV)  |  SPS: {SPS_TARGET} nm (11.03 eV)")
+    print("=" * 60)
+
+    root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)
+    try:
+        filepaths = list(filedialog.askopenfilenames(
+            title="Select OES Power Scan Files",
+            filetypes=[("Text/CSV files", "*.txt *.csv"), ("All files", "*.*")]))
+    finally:
+        root.destroy()
+
+    if not filepaths:
+        print("No files selected."); return
+    print(f"\n{len(filepaths)} file(s) selected.\n")
+
+    normalise = (input(
+        "Normalise by integration time? (y/n) [n]:\n"
+        "  (answer 'n' for calibrated _cal.txt files — already corrected): "
+    ).lower() or 'n').startswith('y')
+    all_records = extract_ratios(filepaths, normalise)
+    if not all_records:
+        print("No valid records — check filenames contain power in Watts e.g. '175W'."); return
+
+    records_pure  = [r for r in all_records if r['argon_pct'] == 0.0] or all_records
+    records_argon = [r for r in all_records if r['argon_pct'] != 0.0] or None
+    records_up    = [r for r in all_records if r['ramp_direction'] == 'up']
+    records_down  = [r for r in all_records if r['ramp_direction'] == 'down']
+
+    pressures = sorted(set(r['pressure'] for r in all_records))
+    print(f"\n  Pure N2: {len(records_pure)}  |  N2+Ar: {len(records_argon or [])}  |"
+          f"  Up-ramp: {len(records_up)}  |  Down-ramp: {len(records_down)}")
+    print(f"  Pressures found: {', '.join(pressures)}\n")
+
+    disc = detect_transition(
+        [r['power'] for r in records_pure],
+        [r['ratio'] for r in records_pure]
+    )
+
+    plot_ratio(records_pure, records_argon, disc)
+    plot_raw_intensities(records_pure, disc)
+    #plot_derivative(disc) # Not pertinent enough (not enough report space)
+    plot_piecewise(records_pure, disc)
+
+    if records_up and records_down:
+        if (input("\nPlot hysteresis? (y/n) [y]: ").lower() or 'y').startswith('y'):
+            plot_hysteresis(records_up, records_down)
+    else:
+        print("  Tip: add 'rampup'/'rampdown' to filenames to enable hysteresis plot.")
+
+    if (input("\nExport to CSV? (y/n) [y]: ").lower() or 'y').startswith('y'):
+        pd.DataFrame(all_records).sort_values('power').to_csv(
+            'ratio_results.csv', index=False)
+        print("  Saved: ratio_results.csv")
+
+    print("\n  Done. Check for: kink in ratio plot | ΔR² > 0.05 | derivative spike | hysteresis gap")
+
+
+if __name__ == "__main__":
+    main()
