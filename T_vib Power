@@ -1,0 +1,326 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+import os
+import tkinter as tk 
+from tkinter import filedialog, simpledialog, messagebox
+from scipy.stats import linregress, t as t_dist
+
+# ─────────────────────────────────────────────
+#  Plot style — publication quality
+# ─────────────────────────────────────────────
+
+COLOURS = {
+    'blue':   '#4878CF',
+    'red':    '#C44E52',
+    'green':  '#6ACC65',
+    'orange': '#D0732B',
+    'purple': '#8172B2',
+    'teal':   '#4DAFAA',
+    'grey':   '#555555',
+    'black':  '#222222',
+}
+
+PRESSURE_COLOURS = [
+    '#4878CF', '#C44E52', '#6ACC65', '#D0732B',
+    '#8172B2', '#4DAFAA', '#222222', '#e377c2',
+]
+
+# Added list of distinct markers
+MARKERS = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
+
+def apply_thesis_style(ax):
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(0.8)
+    ax.spines['bottom'].set_linewidth(0.8)
+    ax.tick_params(axis='both', direction='in', length=4, width=0.8)
+    ax.grid(False)
+
+
+# ─────────────────────────────────────────────
+#  Peak definitions (N2 Second Positive System: C -> B)
+# ─────────────────────────────────────────────
+
+sps_peaks = [
+    {'v_prime': 0, 'v_double_prime': 2, 'wl': 380.4, 'q': 0.1462,  'E': 0},
+    {'v_prime': 1, 'v_double_prime': 3, 'wl': 375.4, 'q': 0.199,   'E': 2008},
+    {'v_prime': 2, 'v_double_prime': 4, 'wl': 370.9, 'q': 0.1605,  'E': 3969},
+    {'v_prime': 3, 'v_double_prime': 5, 'wl': 367.1, 'q': 0.09426, 'E': 5883},
+]
+
+
+# ─────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────
+
+def extract_experiment_params(filename):
+    base_name = os.path.basename(filename)
+    power_match    = re.search(r'(\d+\.?\d*)\s*W',     base_name, re.IGNORECASE)
+    pressure_match = re.search(r'(\d+\.?\d*)\s*mTorr', base_name, re.IGNORECASE)
+    p  = float(power_match.group(1))    if power_match    else None
+    pr = float(pressure_match.group(1)) if pressure_match else None
+    return p, pr
+
+
+def calculate_vibrational_temperature(df):
+    x_data = []
+    y_data = []
+    k_cm   = 0.695
+
+    for peak in sps_peaks:
+        mask   = (df['wavelength_nm'] > peak['wl'] - 0.5) & (df['wavelength_nm'] < peak['wl'] + 0.5)
+        region = df[mask]
+        if not region.empty:
+            intensity = region['cal_intensity'].max()
+            if intensity > 0:
+                y_val = np.log((intensity * (peak['wl'] ** 4)) / peak['q'])
+                x_data.append(peak['E'])
+                y_data.append(y_val)
+
+    if len(x_data) > 1:
+        slope, intercept, r_value, p_value, std_err = linregress(x_data, y_data)
+        t_vib = -1 / (slope * k_cm)
+        # Propagate slope uncertainty to Tvib: δTvib = Tvib² * k_cm * δslope
+        tvib_err = (t_vib ** 2) * k_cm * std_err
+        return t_vib, r_value ** 2, slope, intercept, x_data, y_data, std_err, tvib_err
+
+    return None, None, None, None, None, None, None, None
+
+
+def ask_error_bar_method():
+    """Ask user which error bar method to use."""
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    choice = messagebox.askquestion(
+        "Error Bar Method",
+        "How should error bars be calculated?\n\n"
+        "YES  →  Standard deviation of repeat measurements\n"
+        "         (use this if you have multiple spectra per condition)\n\n"
+        "NO   →  Propagated fit uncertainty from Boltzmann regression\n"
+        "         (use this if each condition has only one spectrum)\n",
+        icon='question'
+    )
+    root.destroy()
+    return 'repeat_std' if choice == 'yes' else 'fit_uncertainty'
+
+
+def ask_confidence_level():
+    """Ask user for confidence interval level."""
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    answer = simpledialog.askstring(
+        "Confidence Level",
+        "Enter error bar confidence level:\n\n"
+        "  '1sigma'  →  ±1σ  (~68%)\n"
+        "  '2sigma'  →  ±2σ  (~95%)\n"
+        "  '95'      →  95% confidence interval\n\n"
+        "Default: 1sigma",
+        initialvalue="1sigma"
+    )
+    root.destroy()
+    return (answer or "1sigma").strip().lower()
+
+
+def select_files():
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    try:
+        selected = filedialog.askopenfilenames(
+            title="Select OES Spectrum Files",
+            filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+    return list(selected)
+
+
+def compute_error(tvib_values, tvib_errs, error_method, confidence):
+    """Return a single error bar value given method and confidence."""
+    if error_method == 'repeat_std' and len(tvib_values) > 1:
+        base_err = np.std(tvib_values, ddof=1)
+    else:
+        base_err = np.mean(tvib_errs) if tvib_errs else 0.0
+
+    if confidence == '2sigma':
+        return 2.0 * base_err
+    elif confidence == '95':
+        n     = max(len(tvib_values), 2)
+        t_val = t_dist.ppf(0.975, df=n - 1)
+        return t_val * base_err / np.sqrt(n)
+    else:  # 1sigma default
+        return base_err
+
+
+# ─────────────────────────────────────────────
+#  Main processing
+# ─────────────────────────────────────────────
+
+def process_and_plot(files, error_method, confidence):
+    if not files:
+        print("No files selected. Exiting.")
+        return
+
+    # data[pressure][power] = list of (tvib, tvib_err)
+    data = {}
+
+    print(f"\nSelected {len(files)} file(s). Starting analysis...")
+
+    for filepath in files:
+        f = os.path.basename(filepath)
+        power, pressure = extract_experiment_params(filepath)
+
+        if power is None or pressure is None:
+            print(f"Skipping {f}: Could not find Power or Pressure in name.")
+            continue
+
+        try:
+            df = pd.read_csv(filepath)
+            result = calculate_vibrational_temperature(df)
+            tvib, r2, slope, intercept, x_dat, y_dat, slope_err, tvib_err = result
+
+            if tvib is None:
+                print(f"Skipping {f}: Could not calculate Tvib.")
+                continue
+
+            print(f"Analysed {f}: Tvib = {tvib:.0f} K  ±{tvib_err:.0f} K  (R²={r2:.3f})")
+
+            # Boltzmann plot
+            # fig, ax = plt.subplots(figsize=(8, 6))
+            # ax.scatter(x_dat, y_dat, color=COLOURS['blue'], s=60, zorder=5,
+            #            label='Experimental points')
+            # x_line = np.linspace(min(x_dat), max(x_dat), 100)
+            # ax.plot(x_line, slope * x_line + intercept, '--',
+            #         color=COLOURS['red'], linewidth=1.5,
+            #         label=f'Linear fit ($R^2$ = {r2:.3f})')
+            # ax.text(0.98, 0.95, f'$T_{{vib}}$ = {tvib:.0f} K',
+            #         transform=ax.transAxes, ha='right', va='top',
+            #         fontsize=10, color=COLOURS['grey'])
+            # ax.set_xlabel('Energy $E$ (cm$^{-1}$)')
+            # ax.set_ylabel('ln($I \cdot \lambda^4 / q$)')
+            # ax.legend(frameon=False, fontsize=9)
+            # apply_thesis_style(ax)
+            # plt.tight_layout()
+            # plt.show()
+
+            # Store result
+            if pressure not in data:
+                data[pressure] = {}
+            if power not in data[pressure]:
+                data[pressure][power] = []
+            data[pressure][power].append((tvib, tvib_err))
+
+        except Exception as e:
+            print(f"Error processing {f}: {e}")
+
+    if not data:
+        print("No valid data found to plot trends.")
+        return
+
+    # ── Tvib vs Power — one coloured line per pressure ────────────────
+    fig, ax = plt.subplots(figsize=(9, 6))
+    sorted_pressures = sorted(data.keys())
+    
+    # Map both a colour and a marker to each pressure
+    colour_map = {p: PRESSURE_COLOURS[i % len(PRESSURE_COLOURS)]
+                  for i, p in enumerate(sorted_pressures)}
+    marker_map = {p: MARKERS[i % len(MARKERS)]
+                  for i, p in enumerate(sorted_pressures)}
+
+    for pressure in sorted_pressures:
+        power_dict    = data[pressure]
+        powers_sorted = sorted(power_dict.keys())
+        tvib_means, tvib_errs_plot = [], []
+
+        for power in powers_sorted:
+            entries = power_dict[power]
+            tv_vals = [e[0] for e in entries]
+            tv_errs = [e[1] for e in entries]
+            tvib_means.append(np.mean(tv_vals))
+            tvib_errs_plot.append(compute_error(tv_vals, tv_errs, error_method, confidence))
+
+        ax.errorbar(
+            powers_sorted, tvib_means,
+            yerr=tvib_errs_plot,
+            linestyle='-',
+            marker=marker_map[pressure],  # Dynamic marker added here
+            color=colour_map[pressure],
+            linewidth=1.5, markersize=6,  # Increased markersize to 6
+            capsize=4, capthick=0.8, elinewidth=0.8,
+            label=f'{pressure:.0f} mTorr',
+        )
+
+    ax.set_xlabel('Power (W)')
+    ax.set_ylabel('$T_{vib}$ (K)')
+    ax.legend(frameon=False, fontsize=9, title='Pressure', title_fontsize=9)
+    apply_thesis_style(ax)
+    plt.tight_layout()
+    plt.show()
+
+    # ── Tvib vs Pressure — one coloured line per power ────────────────
+    data_by_power = {}
+    for pressure, power_dict in data.items():
+        for power, entries in power_dict.items():
+            if power not in data_by_power:
+                data_by_power[power] = {}
+            data_by_power[power][pressure] = entries
+
+    fig2, ax2 = plt.subplots(figsize=(9, 6))
+    sorted_powers  = sorted(data_by_power.keys())
+    
+    # Map both a colour and a marker to each power
+    colour_map_pw  = {pw: PRESSURE_COLOURS[i % len(PRESSURE_COLOURS)]
+                      for i, pw in enumerate(sorted_powers)}
+    marker_map_pw  = {pw: MARKERS[i % len(MARKERS)]
+                      for i, pw in enumerate(sorted_powers)}
+
+    for power in sorted_powers:
+        pressure_dict    = data_by_power[power]
+        pressures_sorted = sorted(pressure_dict.keys())
+        tvib_means, tvib_errs_plot = [], []
+
+        for pressure in pressures_sorted:
+            entries = pressure_dict[pressure]
+            tv_vals = [e[0] for e in entries]
+            tv_errs = [e[1] for e in entries]
+            tvib_means.append(np.mean(tv_vals))
+            tvib_errs_plot.append(compute_error(tv_vals, tv_errs, error_method, confidence))
+
+        ax2.errorbar(
+            pressures_sorted, tvib_means,
+            yerr=tvib_errs_plot,
+            linestyle='-',
+            marker=marker_map_pw[power],  # Dynamic marker added here
+            color=colour_map_pw[power],
+            linewidth=1.5, markersize=6,  # Increased markersize to 6
+            capsize=4, capthick=0.8, elinewidth=0.8,
+            label=f'{power:.0f} W',
+        )
+
+    ax2.set_xlabel('Pressure (mTorr)')
+    ax2.set_ylabel('$T_{vib}$ (K)')
+    ax2.legend(frameon=False, fontsize=9, title='Power', title_fontsize=9)
+    apply_thesis_style(ax2)
+    plt.tight_layout()
+    plt.show()
+
+
+# ─────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    files = select_files()
+
+    if not files:
+        print("No files selected. Exiting.")
+    else:
+        error_method = ask_error_bar_method()
+        confidence   = ask_confidence_level()
+        print(f"\nError method : {error_method}")
+        print(f"Confidence   : {confidence}")
+        process_and_plot(files, error_method, confidence)
