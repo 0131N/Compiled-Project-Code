@@ -1,0 +1,167 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+import os
+import tkinter as tk 
+from tkinter import filedialog, simpledialog, messagebox
+from scipy.stats import linregress
+
+# ─────────────────────────────────────────────
+#  Plot style — publication quality
+# ─────────────────────────────────────────────
+
+COLOURS = {
+    'blue':   '#4878CF',
+    'red':    '#C44E52',
+    'green':  '#6ACC65',
+    'orange': '#D0732B',
+    'purple': '#8172B2',
+    'teal':   '#4DAFAA',
+    'grey':   '#555555',
+    'black':  '#222222',
+}
+
+PRESSURE_COLOURS = [
+    '#4878CF', '#C44E52', '#6ACC65', '#D0732B',
+    '#8172B2', '#4DAFAA', '#222222', '#e377c2',
+]
+
+def apply_thesis_style(ax):
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(0.8)
+    ax.spines['bottom'].set_linewidth(0.8)
+    ax.tick_params(axis='both', direction='in', length=4, width=0.8)
+    ax.grid(False)
+
+# ─────────────────────────────────────────────
+#  Peak definitions (N2 Second Positive System)
+# ─────────────────────────────────────────────
+
+sps_peaks = [
+    {'v_prime': 0, 'v_double_prime': 2, 'wl': 380.4, 'q': 0.1462,  'E': 0},
+    {'v_prime': 1, 'v_double_prime': 3, 'wl': 375.4, 'q': 0.199,   'E': 2008},
+    {'v_prime': 2, 'v_double_prime': 4, 'wl': 370.9, 'q': 0.1605,  'E': 3969},
+    {'v_prime': 3, 'v_double_prime': 5, 'wl': 367.1, 'q': 0.09426, 'E': 5883},
+]
+
+# ─────────────────────────────────────────────
+#  UI & Helper Functions
+# ─────────────────────────────────────────────
+
+def select_files():
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    try:
+        selected = filedialog.askopenfilenames(
+            title="Select OES Spectrum Files",
+            filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+    return list(selected)
+
+def extract_experiment_params(filename):
+    base_name = os.path.basename(filename)
+    power_match    = re.search(r'(\d+\.?\d*)\s*W',     base_name, re.IGNORECASE)
+    pressure_match = re.search(r'(\d+\.?\d*)\s*mTorr', base_name, re.IGNORECASE)
+    argon_match    = re.search(r'(\d+\.?\d*)\s*(?:%|percent)', base_name, re.IGNORECASE)
+    
+    p  = float(power_match.group(1))    if power_match    else 0.0
+    pr = float(pressure_match.group(1)) if pressure_match else 10.0 # Default based on your files
+    ar = float(argon_match.group(1))    if argon_match    else 0.0
+    return p, pr, ar
+
+# ─────────────────────────────────────────────
+#  Core Analysis
+# ─────────────────────────────────────────────
+
+def calculate_vibrational_temperature(df):
+    x_data, y_data, v_levels = [], [], []
+    k_cm = 0.695
+
+    # Check for intensity column name (adjust if your CSV uses something else)
+    int_col = 'cal_intensity' if 'cal_intensity' in df.columns else df.columns[1]
+
+    for peak in sps_peaks:
+        mask = (df.iloc[:,0] > peak['wl'] - 0.6) & (df.iloc[:,0] < peak['wl'] + 0.6)
+        region = df[mask]
+        if not region.empty:
+            intensity = region[int_col].max()
+            if intensity > 0:
+                # Boltzmann Y: ln(I * lambda^4 / q)
+                y_val = np.log((intensity * (peak['wl'] ** 4)) / peak['q'])
+                x_data.append(peak['E'])
+                y_data.append(y_val)
+                v_levels.append(peak['v_prime'])
+
+    if len(x_data) > 2:
+        slope, intercept, r_value, p_value, std_err = linregress(x_data, y_data)
+        t_vib = -1 / (slope * k_cm)
+        
+        # RESIDUALS: Actual Y - Fit Y
+        y_pred = slope * np.array(x_data) + intercept
+        residuals = np.array(y_data) - y_pred
+        
+        return t_vib, r_value**2, slope, intercept, x_data, y_data, residuals, v_levels
+    return [None]*8
+
+def process_and_plot(files):
+    summary_residuals = {}
+
+    for filepath in files:
+        f = os.path.basename(filepath)
+        power, pressure, argon = extract_experiment_params(filepath)
+
+        try:
+            df = pd.read_csv(filepath)
+            res_vals = calculate_vibrational_temperature(df)
+            tvib, r2, slope, intercept, x_dat, y_dat, res, v_levs = res_vals
+
+            if tvib is None: continue
+
+            print(f"Analysed {f}: Tvib = {tvib:.0f} K (R²={r2:.4f})")
+
+            if argon not in summary_residuals:
+                summary_residuals[argon] = []
+            summary_residuals[argon].append((v_levs, res))
+
+        except Exception as e:
+            print(f"Error processing {f}: {e}")
+
+    # --- PLOT: RESIDUAL ANALYSIS ---
+    if not summary_residuals:
+        print("No valid data to plot.")
+        return
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    sorted_ar = sorted(summary_residuals.keys())
+    
+    for i, ar_pct in enumerate(sorted_ar):
+        # Average residuals if multiple spectra exist for the same Ar%
+        all_v, all_r = [], []
+        for v_list, r_list in summary_residuals[ar_pct]:
+            all_v.extend(v_list); all_r.extend(r_list)
+        
+        avg_res = pd.DataFrame({'v': all_v, 'r': all_r}).groupby('v').mean().reset_index()
+        
+        color = PRESSURE_COLOURS[i % len(PRESSURE_COLOURS)]
+        ax.plot(avg_res['v'], avg_res['r'], 'o-', label=f'{ar_pct}% Argon', 
+                color=color, linewidth=2, markersize=8)
+
+    ax.axhline(0, color='black', linestyle='--', alpha=0.5)
+    ax.set_xlabel('Vibrational Level ($v\'$)')
+    ax.set_ylabel('Residual [$ln(I_{obs}) - ln(I_{fit})$]')
+
+    ax.set_xticks([0, 1, 2, 3])
+    ax.legend(frameon=False, title='Argon %')
+    apply_thesis_style(ax)
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    files = select_files()
+    if files:
+        process_and_plot(files)
