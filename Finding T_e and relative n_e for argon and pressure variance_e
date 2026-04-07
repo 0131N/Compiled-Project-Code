@@ -1,0 +1,383 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+import os
+import tkinter as tk
+from tkinter import filedialog, simpledialog, messagebox
+from scipy.stats import t as t_dist
+
+# ─────────────────────────────────────────────
+#  Plot style — publication quality
+# ─────────────────────────────────────────────
+
+COLOURS = {
+    'blue':   '#4878CF',
+    'red':    '#C44E52',
+    'green':  '#6ACC65',
+    'orange': '#D0732B',
+    'purple': '#8172B2',
+    'teal':   '#4DAFAA',
+    'grey':   '#555555',
+    'black':  '#222222',
+}
+
+LINE_COLOURS = [
+    '#4878CF', '#C44E52', '#6ACC65', '#D0732B',
+    '#8172B2', '#4DAFAA', '#222222', '#e377c2',
+]
+
+def apply_thesis_style(ax):
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(0.8)
+    ax.spines['bottom'].set_linewidth(0.8)
+    ax.tick_params(axis='both', direction='in', length=4, width=0.8)
+    ax.grid(False)
+
+
+# ─────────────────────────────────────────────
+#  Peak definitions
+# ─────────────────────────────────────────────
+
+peaks_te = {
+    'ion':     {'wl': 391.4, 'E_th': 18.8,  'name': 'N2+ (FNS)'},
+    'neutral': {'wl': 380.5, 'E_th': 11.03, 'name': 'N2 (SPS)'},
+}
+
+
+# ─────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────
+
+def extract_experiment_params(filename):
+    """Extract Argon % and Pressure (mTorr) from filename.
+
+    Supported argon patterns:
+        argon5%  /  argon 5%  /  Ar5%  /  Ar 5%  /  5%Ar  /  5%argon
+    Pure N2 files with no argon token are assigned 0 %.
+    """
+    base = os.path.basename(filename)
+
+    argon_patterns = [
+        r'argon\s*(\d+\.?\d*)\s*%',
+        r'ar\s*(\d+\.?\d*)\s*%',
+        r'(\d+\.?\d*)\s*%\s*ar(?:gon)?',
+    ]
+    argon = None
+    for pat in argon_patterns:
+        m = re.search(pat, base, re.IGNORECASE)
+        if m:
+            argon = float(m.group(1))
+            break
+    if argon is None:
+        argon = 0.0
+
+    pressure_m = re.search(r'(\d+\.?\d*)\s*mTorr', base, re.IGNORECASE)
+    pressure   = float(pressure_m.group(1)) if pressure_m else None
+
+    return argon, pressure
+
+
+def calculate_te_and_ne(df, pressure_mtorr):
+    mask_ion = (
+        (df['wavelength_nm'] > peaks_te['ion']['wl'] - 0.5) &
+        (df['wavelength_nm'] < peaks_te['ion']['wl'] + 0.5)
+    )
+    mask_neutral = (
+        (df['wavelength_nm'] > peaks_te['neutral']['wl'] - 0.5) &
+        (df['wavelength_nm'] < peaks_te['neutral']['wl'] + 0.5)
+    )
+    region_ion     = df[mask_ion]
+    region_neutral = df[mask_neutral]
+
+    if region_ion.empty or region_neutral.empty:
+        return None, None, None, None, None, None, None
+
+    i_ion   = region_ion['cal_intensity'].max()
+    i_neut  = region_neutral['cal_intensity'].max()
+    wl_ion  = region_ion.loc[region_ion['cal_intensity'].idxmax(),     'wavelength_nm']
+    wl_neut = region_neutral.loc[region_neutral['cal_intensity'].idxmax(), 'wavelength_nm']
+
+    if i_neut <= 0 or i_ion <= 0:
+        return None, None, None, None, None, None, None
+
+    ratio   = i_ion / i_neut
+    delta_E = peaks_te['ion']['E_th'] - peaks_te['neutral']['E_th']
+    ln_A    = 1.0566
+
+    try:
+        t_e = delta_E / (ln_A - np.log(ratio))
+        if t_e <= 0 or t_e > 20:
+            t_e = None
+    except ZeroDivisionError:
+        t_e = None
+
+    if t_e is None:
+        return None, None, ratio, i_ion, i_neut, wl_ion, wl_neut
+
+    pressure_val = pressure_mtorr if pressure_mtorr else 1.0
+    ne_rel = i_ion / (pressure_val * np.exp(-peaks_te['ion']['E_th'] / t_e))
+
+    return t_e, ne_rel, ratio, i_ion, i_neut, wl_ion, wl_neut
+
+
+def select_files():
+    root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)
+    try:
+        selected = filedialog.askopenfilenames(
+            title="Select OES Spectrum Files",
+            filetypes=[("Text/CSV files", "*.txt *.csv"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+    return list(selected)
+
+
+def ask_error_bar_method():
+    root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)
+    choice = messagebox.askquestion(
+        "Error Bar Method",
+        "How should error bars be calculated?\n\n"
+        "YES  →  Standard deviation of repeat measurements\n"
+        "         (use this if you have multiple spectra per condition)\n\n"
+        "NO   →  10% estimate of the value\n"
+        "         (use this if each condition has only one spectrum)\n",
+        icon='question'
+    )
+    root.destroy()
+    return 'repeat_std' if choice == 'yes' else 'estimate'
+
+
+def ask_confidence_level():
+    root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)
+    answer = simpledialog.askstring(
+        "Confidence Level",
+        "Enter error bar confidence level:\n\n"
+        "  '1sigma'  →  ±1σ  (~68%)\n"
+        "  '2sigma'  →  ±2σ  (~95%)\n"
+        "  '95'      →  95% confidence interval\n\n"
+        "Default: 1sigma",
+        initialvalue="1sigma"
+    )
+    root.destroy()
+    return (answer or "1sigma").strip().lower()
+
+
+def compute_error(values, error_method, confidence):
+    values = [v for v in values if v is not None]
+    if not values:
+        return 0.0
+    if error_method == 'repeat_std' and len(values) > 1:
+        base_err = np.std(values, ddof=1)
+    else:
+        base_err = np.mean(values) * 0.10
+    if confidence == '2sigma':
+        return 2.0 * base_err
+    elif confidence == '95':
+        n     = max(len(values), 2)
+        t_val = t_dist.ppf(0.975, df=n - 1)
+        return t_val * base_err / np.sqrt(n)
+    else:
+        return base_err
+
+
+def plot_te_and_ne(ax_te, ax_ne, x_values, te_means, te_errs,
+                   ne_means, ne_errs, colour, label):
+    ax_te.errorbar(
+        x_values, te_means, yerr=te_errs,
+        fmt='o-', color=colour,
+        linewidth=1.5, markersize=5,
+        capsize=4, capthick=0.8, elinewidth=0.8,
+        label=label,
+    )
+    ax_ne.errorbar(
+        x_values, ne_means, yerr=ne_errs,
+        fmt='o-', color=colour,
+        linewidth=1.5, markersize=5,
+        capsize=4, capthick=0.8, elinewidth=0.8,
+        label=label,
+    )
+
+
+# ─────────────────────────────────────────────
+#  Main processing
+# ─────────────────────────────────────────────
+
+def process_and_plot(files, error_method, confidence):
+    if not files:
+        print("No files selected. Exiting.")
+        return
+
+    # data[pressure][argon] = {'Te': [...], 'ne': [...]}
+    data = {}
+
+    print(f"\nSelected {len(files)} file(s). Starting analysis...")
+
+    for filepath in files:
+        f = os.path.basename(filepath)
+        argon, pressure = extract_experiment_params(filepath)
+
+        if pressure is None:
+            print(f"Skipping {f}: Could not find Pressure (mTorr) in filename.")
+            continue
+
+        try:
+            df = pd.read_csv(filepath)
+            t_e, ne_rel, ratio, i_ion, i_neut, wl_ion, wl_neut = \
+                calculate_te_and_ne(df, pressure)
+
+            if t_e is None:
+                print(f"Skipping {f}: Te could not be calculated (ratio={ratio}).")
+                continue
+
+            ar_label = f"{argon:.4g}%" if argon > 0 else "0% (Pure N₂)"
+            print(f"  {f}")
+            print(f"    Ar={ar_label}  |  Pressure={pressure:.4g} mTorr  |  "
+                  f"ratio={ratio:.3f}  Te={t_e:.2f} eV  ne(rel)={ne_rel:.2e}")
+
+            # Individual spectrum plot
+            # mask_plot = (df['wavelength_nm'] >= 370) & (df['wavelength_nm'] <= 400)
+            # df_plot   = df[mask_plot]
+            # fig, ax   = plt.subplots(figsize=(8, 5))
+            # ax.plot(df_plot['wavelength_nm'], df_plot['cal_intensity'],
+            #         color=COLOURS['black'], linewidth=0.9, label='Spectrum')
+            # ax.plot(wl_ion,  i_ion,  'o', color=COLOURS['red'],  markersize=7,
+            #         label=f'391 nm (Ion): {i_ion:.0f}')
+            # ax.plot(wl_neut, i_neut, 'o', color=COLOURS['blue'], markersize=7,
+            #         label=f'380 nm (Neutral): {i_neut:.0f}')
+            # ax.text(0.98, 0.95,
+            #         f'Ratio = {ratio:.3f}\n$T_e$ = {t_e:.2f} eV',
+            #         transform=ax.transAxes, ha='right', va='top',
+            #         fontsize=9, color=COLOURS['grey'])
+            # ax.set_xlabel('Wavelength (nm)')
+            # ax.set_ylabel('Intensity')
+            # ax.legend(frameon=False, fontsize=8)
+            # apply_thesis_style(ax)
+            # plt.tight_layout()
+            # plt.show()
+
+            # Store
+            if pressure not in data:
+                data[pressure] = {}
+            if argon not in data[pressure]:
+                data[pressure][argon] = {'Te': [], 'ne': []}
+            data[pressure][argon]['Te'].append(t_e)
+            data[pressure][argon]['ne'].append(ne_rel)
+
+        except Exception as e:
+            print(f"Error processing {f}: {e}")
+
+    if not data:
+        print("No valid data found to plot trends.")
+        return
+
+    sorted_pressures = sorted(data.keys())
+    sorted_argons    = sorted({ar for pd_ in data.values() for ar in pd_.keys()})
+
+    colour_map_pr = {p:  LINE_COLOURS[i % len(LINE_COLOURS)]
+                     for i, p  in enumerate(sorted_pressures)}
+    colour_map_ar = {ar: LINE_COLOURS[i % len(LINE_COLOURS)]
+                     for i, ar in enumerate(sorted_argons)}
+
+    # ════════════════════════════════════════════════════════════════
+    #  Figure 1 — Te vs Argon %  &  ne vs Argon %
+    #             one coloured line per pressure
+    # ════════════════════════════════════════════════════════════════
+    fig1, (ax1_te, ax1_ne) = plt.subplots(1, 2, figsize=(14, 6))
+
+    for pressure in sorted_pressures:
+        argons_with_pressure = sorted(data[pressure].keys())
+        if not argons_with_pressure:
+            continue
+
+        te_means, te_errs, ne_means, ne_errs = [], [], [], []
+        for argon in argons_with_pressure:
+            tv = data[pressure][argon]['Te']
+            nv = data[pressure][argon]['ne']
+            te_means.append(np.mean(tv))
+            te_errs.append(compute_error(tv, error_method, confidence))
+            ne_means.append(np.mean(nv))
+            ne_errs.append(compute_error(nv, error_method, confidence))
+
+        plot_te_and_ne(
+            ax1_te, ax1_ne,
+            argons_with_pressure,
+            te_means, te_errs,
+            ne_means, ne_errs,
+            colour=colour_map_pr[pressure],
+            label=f'{pressure:.0f} mTorr',
+        )
+
+    ax1_te.set_xlabel('Argon Content (%)')
+    ax1_te.set_ylabel('$T_e$ (eV)')
+    ax1_te.legend(frameon=False, fontsize=9, title='Pressure', title_fontsize=9)
+    apply_thesis_style(ax1_te)
+
+    ax1_ne.set_xlabel('Argon Content (%)')
+    ax1_ne.set_ylabel('Relative $n_e$ (a.u.)')
+    ax1_ne.legend(frameon=False, fontsize=9, title='Pressure', title_fontsize=9)
+    apply_thesis_style(ax1_ne)
+
+    plt.tight_layout()
+    plt.show()
+
+    # ════════════════════════════════════════════════════════════════
+    #  Figure 2 — Te vs Pressure  &  ne vs Pressure
+    #             one coloured line per argon %
+    # ════════════════════════════════════════════════════════════════
+    fig2, (ax2_te, ax2_ne) = plt.subplots(1, 2, figsize=(14, 6))
+
+    for argon in sorted_argons:
+        pressures_with_argon = sorted([p for p in sorted_pressures
+                                       if argon in data[p]])
+        if not pressures_with_argon:
+            continue
+
+        te_means, te_errs, ne_means, ne_errs = [], [], [], []
+        for pressure in pressures_with_argon:
+            tv = data[pressure][argon]['Te']
+            nv = data[pressure][argon]['ne']
+            te_means.append(np.mean(tv))
+            te_errs.append(compute_error(tv, error_method, confidence))
+            ne_means.append(np.mean(nv))
+            ne_errs.append(compute_error(nv, error_method, confidence))
+
+        ar_label = f'Ar {argon:.4g}%' if argon > 0 else 'Pure N₂'
+        plot_te_and_ne(
+            ax2_te, ax2_ne,
+            pressures_with_argon,
+            te_means, te_errs,
+            ne_means, ne_errs,
+            colour=colour_map_ar[argon],
+            label=ar_label,
+        )
+
+    ax2_te.set_xlabel('Pressure (mTorr)')
+    ax2_te.set_ylabel('$T_e$ (eV)')
+    ax2_te.legend(frameon=False, fontsize=9, title='Argon %', title_fontsize=9)
+    apply_thesis_style(ax2_te)
+
+    ax2_ne.set_xlabel('Pressure (mTorr)')
+    ax2_ne.set_ylabel('Relative $n_e$ (a.u.)')
+    ax2_ne.legend(frameon=False, fontsize=9, title='Argon %', title_fontsize=9)
+    apply_thesis_style(ax2_ne)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ─────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    files = select_files()
+    if not files:
+        print("No files selected. Exiting.")
+    else:
+        error_method = ask_error_bar_method()
+        confidence   = ask_confidence_level()
+        print(f"\nError method : {error_method}")
+        print(f"Confidence   : {confidence}")
+        process_and_plot(files, error_method, confidence)
