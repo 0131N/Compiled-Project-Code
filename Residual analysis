@@ -3,12 +3,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 import re
 import os
-import tkinter as tk 
-from tkinter import filedialog, simpledialog, messagebox
-from scipy.stats import linregress
+from scipy.integrate import trapezoid
 
 # ─────────────────────────────────────────────
-#  Plot style — publication quality
+#  Configuration
+# ─────────────────────────────────────────────
+
+DIRECTORY = r"C:\Users\User\oceanview\Nitrogen\Corrected\Broad Wavelength Argon vs Pressure NEW settup\Sorted"   # <-- set this
+
+# Narrow the analysis to a specific condition, or set to None for all files
+FILTER_PRESSURE  = None     # e.g. 10.0  or  None
+FILTER_ARGON_MAX = None     # e.g. 9.0   or  None  (upper limit on Ar%)
+INTEGRATION_WINDOW_NM = 1.5 # ±nm around each line centre for integration
+
+# ─────────────────────────────────────────────
+#  Plot style — matches existing thesis code
 # ─────────────────────────────────────────────
 
 COLOURS = {
@@ -22,12 +31,11 @@ COLOURS = {
     'black':  '#222222',
 }
 
-PRESSURE_COLOURS = [
-    '#4878CF', '#C44E52', '#6ACC65', '#D0732B',
-    '#8172B2', '#4DAFAA', '#222222', '#e377c2',
-]
+COLOUR_LIST = list(COLOURS.values())
+
 
 def apply_thesis_style(ax):
+    """Apply publication-quality styling to an axes object."""
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.spines['left'].set_linewidth(0.8)
@@ -35,133 +43,405 @@ def apply_thesis_style(ax):
     ax.tick_params(axis='both', direction='in', length=4, width=0.8)
     ax.grid(False)
 
+
 # ─────────────────────────────────────────────
-#  Peak definitions (N2 Second Positive System)
+#  Spectral feature definitions
 # ─────────────────────────────────────────────
 
-sps_peaks = [
-    {'v_prime': 0, 'v_double_prime': 2, 'wl': 380.4, 'q': 0.1462,  'E': 0},
-    {'v_prime': 1, 'v_double_prime': 3, 'wl': 375.4, 'q': 0.199,   'E': 2008},
-    {'v_prime': 2, 'v_double_prime': 4, 'wl': 370.9, 'q': 0.1605,  'E': 3969},
-    {'v_prime': 3, 'v_double_prime': 5, 'wl': 367.1, 'q': 0.09426, 'E': 5883},
+# N2 Second Positive System band heads (nm) — same as existing Tvib code
+SPS_BANDS = {
+    'SPS (0,0)': 336.9,
+    'SPS (1,0)': 315.8,
+    'SPS (0,1)': 357.5,
+    'SPS (0,2)': 380.2,
+    'SPS (0,3)': 405.6,
+}
+
+# N2 First Positive System (B3Pg -> A3Su+) band heads (nm)
+# The A state IS the N2 metastable — FPS emission directly probes the
+# cascade from C (via SPS) into the metastable population.
+# Prediction: FPS/SPS rises with Ar% up to ~3%, then saturates (pooling).
+FPS_BANDS = {
+    'FPS (3,2)':  622.0,
+    'FPS (4,3)':  632.0,
+    'FPS (2,0)':  645.0,
+    'FPS (3,1)':  660.0,
+    'FPS (4,2)':  670.0,
+    'FPS (2,1)':  694.0,
+    'FPS (3,2)b': 745.0,
+    'FPS (2,2)':  772.0,
+    'FPS (3,3)':  820.0,
+    'FPS (4,4)':  869.0,
+}
+
+# Ar I NIR lines — labelled by lower-level character
+# "metastable" = terminates on 1s5 or 1s3 (long-lived forbidden level)
+# "resonant"   = terminates on 1s4 or 1s2 (fast VUV decay to ground)
+# The ratio I(metastable-terminating) / I(resonant-terminating) tracks
+# the Ar* metastable density. Prediction: rises then saturates at ~3% Ar.
+AR_LINES = {
+    696.5:  ('Ar 2p2->1s5',  'metastable'),
+    706.7:  ('Ar 2p3->1s5',  'metastable'),
+    727.3:  ('Ar 2p3->1s4',  'resonant'),
+    738.4:  ('Ar 2p5->1s4',  'resonant'),
+    750.4:  ('Ar 2p1->1s2',  'resonant'),      # primary resonant reference
+    751.5:  ('Ar 2p5->1s3',  'metastable'),
+    763.5:  ('Ar 2p6->1s4',  'resonant'),
+    794.8:  ('Ar 2p7->1s5',  'metastable'),
+    800.6:  ('Ar 2p8->1s5',  'metastable'),
+    811.5:  ('Ar 2p9->1s5',  'metastable'),    # primary metastable diagnostic
+    826.5:  ('Ar 2p8->1s3',  'metastable'),
+    842.5:  ('Ar 2p8->1s4',  'resonant'),
+    912.3:  ('Ar 2p10->1s5', 'metastable'),
+    922.4:  ('Ar 2p10->1s4', 'resonant'),
+}
+
+# High-lying Ar** lines (>13 eV above ground state)
+# Accessible via Ar* + Ar* pooling (2 x 11.55 eV = 23.1 eV available)
+# NOT efficiently accessible by 3-5 eV electron impact from ground state.
+# Their growth above 3% Ar directly evidences the pooling reaction.
+AR_HIGH = {
+     935.4: "Ar** 4p'[1/2]->4s'",
+     965.8: "Ar** 4p'[3/2]->4s'",
+     978.5: "Ar** 4p'[1/2]->4s'",
+    1047.0: 'Ar** 4p[1/2]->4s',
+    1067.4: 'Ar** 4p[3/2]->4s',
+}
+
+# Diagnostic ratio pairs: (metastable_wl_nm, resonant_wl_nm, label)
+RATIO_PAIRS = [
+    (811.5, 750.4, 'I(811.5) / I(750.4)'),
+    (826.5, 750.4, 'I(826.5) / I(750.4)'),
+    (811.5, 763.5, 'I(811.5) / I(763.5)'),
+    (706.7, 727.3, 'I(706.7) / I(727.3)'),
 ]
 
-# ─────────────────────────────────────────────
-#  UI & Helper Functions
-# ─────────────────────────────────────────────
+# Pooling threshold from PCA analysis (Section IV.B.ii of thesis)
+POOLING_THRESHOLD_PCT = 2.5
 
-def select_files():
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes('-topmost', True)
-    try:
-        selected = filedialog.askopenfilenames(
-            title="Select OES Spectrum Files",
-            filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")],
-        )
-    finally:
-        root.destroy()
-    return list(selected)
+
+# ─────────────────────────────────────────────
+#  Filename parsing — matches existing code style
+# ─────────────────────────────────────────────
 
 def extract_experiment_params(filename):
-    base_name = os.path.basename(filename)
-    power_match    = re.search(r'(\d+\.?\d*)\s*W',     base_name, re.IGNORECASE)
-    pressure_match = re.search(r'(\d+\.?\d*)\s*mTorr', base_name, re.IGNORECASE)
-    argon_match    = re.search(r'(\d+\.?\d*)\s*(?:%|percent)', base_name, re.IGNORECASE)
-    
-    p  = float(power_match.group(1))    if power_match    else 0.0
-    pr = float(pressure_match.group(1)) if pressure_match else 10.0 # Default based on your files
-    ar = float(argon_match.group(1))    if argon_match    else 0.0
-    return p, pr, ar
+    """
+    Extracts Power, Pressure, integration time, and argon% from filename.
+
+    Handles the R26B naming convention, e.g.:
+      Nitrogen_31_8_argon_3_2_10mTorr_70W_vs_35W_ref_300ms_HRC21401_...txt
+
+    For filenames with two power values (e.g. 70W_vs_35W_ref), the FIRST
+    power value found is taken as the actual plasma power.
+
+    Returns: (power_W, pressure_mTorr, integ_time_ms, argon_pct)
+             Any value is None if not found in the filename.
+    """
+    base = os.path.basename(filename)
+
+    # Power — first match only (actual power, not reference power)
+    power_match = re.search(r'(\d+\.?\d*)\s*W', base, re.IGNORECASE)
+    power = float(power_match.group(1)) if power_match else None
+
+    # Pressure
+    pressure_match = re.search(r'(\d+\.?\d*)\s*mTorr', base, re.IGNORECASE)
+    pressure = float(pressure_match.group(1)) if pressure_match else None
+
+    # Integration time
+    time_match = re.search(r'(\d+)\s*ms', base, re.IGNORECASE)
+    integ_ms = float(time_match.group(1)) if time_match else None
+
+    # Argon percentage
+    # argon_X_Y  →  X.Y%   (e.g. argon_3_2 = 3.2%)
+    # argon_X    →  X%     (e.g. argon_9   = 9.0%)
+    # pure / pureN2 → 0%
+    fname_lower = base.lower()
+    ar_decimal  = re.search(r'argon[_\s](\d+)[_\s](\d)(?!\d)', fname_lower)
+    ar_integer  = re.search(r'argon[_\s](\d+)(?:[_\s]|$)',     fname_lower)
+
+    if ar_decimal:
+        argon_pct = float(f"{ar_decimal.group(1)}.{ar_decimal.group(2)}")
+    elif ar_integer:
+        argon_pct = float(ar_integer.group(1))
+    elif 'pure' in fname_lower:
+        argon_pct = 0.0
+    else:
+        argon_pct = None
+
+    return power, pressure, integ_ms, argon_pct
+
 
 # ─────────────────────────────────────────────
-#  Core Analysis
+#  Spectral integration
 # ─────────────────────────────────────────────
 
-def calculate_vibrational_temperature(df):
-    x_data, y_data, v_levels = [], [], []
-    k_cm = 0.695
+def integrate_line(df, centre_nm, window_nm=INTEGRATION_WINDOW_NM):
+    """
+    Baseline-subtracted integrated intensity within ±window_nm of centre_nm.
+    Uses cal_intensity column (already wavelength-calibrated).
+    Returns 0.0 if the line is outside the spectral range.
+    """
+    lo = centre_nm - window_nm * 2.5
+    hi = centre_nm + window_nm * 2.5
+    region = df[(df['wavelength_nm'] >= lo) & (df['wavelength_nm'] <= hi)]
 
-    # Check for intensity column name (adjust if your CSV uses something else)
-    int_col = 'cal_intensity' if 'cal_intensity' in df.columns else df.columns[1]
+    if len(region) < 4:
+        return 0.0
 
-    for peak in sps_peaks:
-        mask = (df.iloc[:,0] > peak['wl'] - 0.6) & (df.iloc[:,0] < peak['wl'] + 0.6)
-        region = df[mask]
-        if not region.empty:
-            intensity = region[int_col].max()
-            if intensity > 0:
-                # Boltzmann Y: ln(I * lambda^4 / q)
-                y_val = np.log((intensity * (peak['wl'] ** 4)) / peak['q'])
-                x_data.append(peak['E'])
-                y_data.append(y_val)
-                v_levels.append(peak['v_prime'])
+    wl    = region['wavelength_nm'].values
+    inten = np.clip(region['cal_intensity'].values, 0, None)
 
-    if len(x_data) > 2:
-        slope, intercept, r_value, p_value, std_err = linregress(x_data, y_data)
-        t_vib = -1 / (slope * k_cm)
-        
-        # RESIDUALS: Actual Y - Fit Y
-        y_pred = slope * np.array(x_data) + intercept
-        residuals = np.array(y_data) - y_pred
-        
-        return t_vib, r_value**2, slope, intercept, x_data, y_data, residuals, v_levels
-    return [None]*8
+    # linear baseline from edge points
+    n_edge   = max(1, int(len(wl) * 0.18))
+    bsl_x    = np.concatenate([wl[:n_edge], wl[-n_edge:]])
+    bsl_y    = np.concatenate([inten[:n_edge], inten[-n_edge:]])
+    coeffs   = np.polyfit(bsl_x, bsl_y, 1) if len(bsl_x) >= 2 \
+               else np.array([0.0, float(np.mean(bsl_y))])
+    baseline = np.polyval(coeffs, wl)
 
-def process_and_plot(files):
-    summary_residuals = {}
+    # integrate core window only
+    core = (wl >= centre_nm - window_nm) & (wl <= centre_nm + window_nm)
+    if core.sum() < 2:
+        return 0.0
 
-    for filepath in files:
-        f = os.path.basename(filepath)
-        power, pressure, argon = extract_experiment_params(filepath)
+    net = np.clip(inten[core] - baseline[core], 0, None)
+    return float(trapezoid(net, wl[core]))
 
-        try:
-            df = pd.read_csv(filepath)
-            res_vals = calculate_vibrational_temperature(df)
-            tvib, r2, slope, intercept, x_dat, y_dat, res, v_levs = res_vals
 
-            if tvib is None: continue
+def compute_fps_sps(df):
+    fps = sum(integrate_line(df, c) for c in FPS_BANDS.values())
+    sps = sum(integrate_line(df, c) for c in SPS_BANDS.values())
+    return fps, sps, (fps / sps if sps > 0 else np.nan)
 
-            print(f"Analysed {f}: Tvib = {tvib:.0f} K (R²={r2:.4f})")
 
-            if argon not in summary_residuals:
-                summary_residuals[argon] = []
-            summary_residuals[argon].append((v_levs, res))
+def compute_ar_ratios(df):
+    intensities = {c: integrate_line(df, c) for c in AR_LINES}
+    ratios = {}
+    for wm, wr, lbl in RATIO_PAIRS:
+        im = intensities.get(wm, 0.0)
+        ir = intensities.get(wr, 0.0)
+        ratios[lbl] = im / ir if ir > 0 else np.nan
+    return ratios
 
-        except Exception as e:
-            print(f"Error processing {f}: {e}")
 
-    # --- PLOT: RESIDUAL ANALYSIS ---
-    if not summary_residuals:
-        print("No valid data to plot.")
+def compute_ar_high(df):
+    return {c: integrate_line(df, c) for c in AR_HIGH}
+
+
+# ─────────────────────────────────────────────
+#  Main processing loop
+# ─────────────────────────────────────────────
+
+def process_and_plot(directory=DIRECTORY):
+    files = [f for f in os.listdir(directory) if f.endswith('.txt')]
+
+    if not files:
+        print("No .txt files found in the directory.")
         return
 
-    fig, ax = plt.subplots(figsize=(9, 6))
-    sorted_ar = sorted(summary_residuals.keys())
-    
-    for i, ar_pct in enumerate(sorted_ar):
-        # Average residuals if multiple spectra exist for the same Ar%
-        all_v, all_r = [], []
-        for v_list, r_list in summary_residuals[ar_pct]:
-            all_v.extend(v_list); all_r.extend(r_list)
-        
-        avg_res = pd.DataFrame({'v': all_v, 'r': all_r}).groupby('v').mean().reset_index()
-        
-        color = PRESSURE_COLOURS[i % len(PRESSURE_COLOURS)]
-        ax.plot(avg_res['v'], avg_res['r'], 'o-', label=f'{ar_pct}% Argon', 
-                color=color, linewidth=2, markersize=8)
+    print(f"Found {len(files)} files. Starting analysis...\n")
 
-    ax.axhline(0, color='black', linestyle='--', alpha=0.5)
-    ax.set_xlabel('Vibrational Level ($v\'$)')
-    ax.set_ylabel('Residual [$ln(I_{obs}) - ln(I_{fit})$]')
+    results = []
 
-    ax.set_xticks([0, 1, 2, 3])
-    ax.legend(frameon=False, title='Argon %')
-    apply_thesis_style(ax)
-    plt.tight_layout()
+    for f in sorted(files):
+        power, pressure, integ_ms, argon_pct = extract_experiment_params(f)
+
+        if any(v is None for v in [power, pressure, argon_pct]):
+            print(f"  Skipped {f}: missing power / pressure / argon% in name.")
+            continue
+
+        # optional filters
+        if FILTER_PRESSURE is not None and abs(pressure - FILTER_PRESSURE) > 1.0:
+            continue
+        if FILTER_ARGON_MAX is not None and argon_pct > FILTER_ARGON_MAX:
+            continue
+
+        try:
+            df = pd.read_csv(os.path.join(directory, f))
+        except Exception as e:
+            print(f"  Error loading {f}: {e}")
+            continue
+
+        # normalise by integration time so different exposures are comparable
+        if integ_ms and integ_ms > 0:
+            df = df.copy()
+            df['cal_intensity'] = df['cal_intensity'] / integ_ms
+
+        fps, sps, fps_sps_ratio = compute_fps_sps(df)
+        ar_ratios               = compute_ar_ratios(df)
+        ar_high                 = compute_ar_high(df)
+
+        r1 = ar_ratios.get('I(811.5) / I(750.4)', np.nan)
+        print(f"  Ar={argon_pct:.1f}%  {pressure:.0f} mTorr  {power:.0f}W  "
+              f"t={integ_ms}ms  |  "
+              f"FPS/SPS={fps_sps_ratio:.4f}  I(811)/I(750)={r1:.4f}")
+
+        results.append({
+            'file':      f,
+            'power':     power,
+            'pressure':  pressure,
+            'integ_ms':  integ_ms,
+            'argon_pct': argon_pct,
+            'fps_sps':   fps_sps_ratio,
+            'ar_ratios': ar_ratios,
+            'ar_high':   ar_high,
+            'df':        df,
+        })
+
+    if not results:
+        print("\nNo valid data processed. Check filename format and DIRECTORY.")
+        return
+
+    results.sort(key=lambda r: (r['pressure'], r['power'], r['argon_pct']))
+    print(f"\nProcessed {len(results)} spectra successfully.")
+
+    # broadband overlay
+    _plot_overlay(results)
+
+    # one three-panel figure per unique (power, pressure) combination
+    groups = {}
+    for r in results:
+        key = (r['power'], r['pressure'])
+        groups.setdefault(key, []).append(r)
+
+    for (pwr, pres), grp in sorted(groups.items()):
+        grp.sort(key=lambda r: r['argon_pct'])
+        if len(grp) < 2:
+            continue
+        _plot_trends(grp, pwr, pres)
+
     plt.show()
 
-if __name__ == "__main__":
-    files = select_files()
-    if files:
-        process_and_plot(files)
+
+# ─────────────────────────────────────────────
+#  Plotting functions
+# ─────────────────────────────────────────────
+
+def _add_threshold(ax):
+    ax.axvline(POOLING_THRESHOLD_PCT,
+               color=COLOURS['grey'], lw=0.9, ls='--', alpha=0.7,
+               label='Penning\u2192pooling threshold (~2\u20133%)')
+
+
+def _plot_overlay(results):
+    """Log-scale overlay of all broadband spectra coloured by Ar%."""
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    ar_vals = [r['argon_pct'] for r in results]
+    cmap    = plt.cm.plasma
+    norm    = plt.Normalize(min(ar_vals), max(ar_vals) if max(ar_vals) > 0 else 1)
+
+    for r in results:
+        df   = r['df']
+        mask = (df['wavelength_nm'] >= 500) & (df['wavelength_nm'] <= 1110)
+        inten = np.clip(df.loc[mask, 'cal_intensity'].values, 1e-9, None)
+        ax.semilogy(df.loc[mask, 'wavelength_nm'].values, inten,
+                    color=cmap(norm(r['argon_pct'])), lw=0.5, alpha=0.8)
+
+    # mark key line positions
+    for wl_c, (_, ltype) in AR_LINES.items():
+        c = COLOURS['red'] if ltype == 'metastable' else COLOURS['blue']
+        ax.axvline(wl_c, color=c, lw=0.35, alpha=0.35, ls='--')
+    for wl_c in AR_HIGH:
+        ax.axvline(wl_c, color=COLOURS['green'], lw=0.4, alpha=0.4, ls=':')
+    for wl_c in FPS_BANDS.values():
+        ax.axvline(wl_c, color=COLOURS['orange'], lw=0.35, alpha=0.3, ls='-.')
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    fig.colorbar(sm, ax=ax, label='Argon (%)')
+
+    from matplotlib.lines import Line2D
+    ax.legend(handles=[
+        Line2D([0],[0], color=COLOURS['red'],    lw=1, ls='--',
+               label='Ar I metastable-terminating'),
+        Line2D([0],[0], color=COLOURS['blue'],   lw=1, ls='--',
+               label='Ar I resonant-terminating'),
+        Line2D([0],[0], color=COLOURS['green'],  lw=1, ls=':',
+               label='Ar** high-lying'),
+        Line2D([0],[0], color=COLOURS['orange'], lw=1, ls='-.',
+               label='N$_2$ FPS band heads'),
+    ], frameon=False, fontsize=8, loc='upper right')
+
+    ax.set_xlabel('Wavelength (nm)')
+    ax.set_ylabel('Calibrated intensity / ms  (log scale)')
+    apply_thesis_style(ax)
+    plt.tight_layout()
+    plt.savefig('broadband_overlay.png', dpi=150)
+
+
+def _plot_trends(grp, power, pressure):
+    """
+    Three-panel figure for a single (power, pressure) condition:
+      Panel 1 — FPS/SPS ratio vs Ar%
+      Panel 2 — Ar NIR metastable/resonant ratios vs Ar%
+      Panel 3 — High-lying Ar** intensities vs Ar%
+    """
+    ar    = np.array([r['argon_pct'] for r in grp])
+    label = f'{power:.0f} W,  {pressure:.0f} mTorr'
+
+    fig, axes = plt.subplots(3, 1, figsize=(8, 12))
+    fig.suptitle('Broadband corroboration of Penning-to-pooling mechanism\n'
+                 + label, fontsize=11, y=1.01)
+
+    # ── Panel 1: FPS / SPS ───────────────────────────────────────────────────
+    ax = axes[0]
+    fps_sps = np.array([r['fps_sps'] for r in grp])
+    ax.plot(ar, fps_sps, 'o-',
+            color=COLOURS['orange'], linewidth=1.5, markersize=6,
+            label='FPS / SPS')
+    _add_threshold(ax)
+    ax.set_xlabel('Argon concentration (%)')
+    ax.set_ylabel('FPS / SPS integrated intensity')
+    ax.legend(frameon=False, fontsize=9)
+    apply_thesis_style(ax)
+
+    # ── Panel 2: Ar NIR ratios ───────────────────────────────────────────────
+    ax = axes[1]
+    ratio_labels = list(grp[0]['ar_ratios'].keys())
+    for idx, lbl in enumerate(ratio_labels):
+        vals  = np.array([r['ar_ratios'].get(lbl, np.nan) for r in grp])
+        valid = ~np.isnan(vals)
+        if valid.sum() < 2:
+            continue
+        ax.plot(ar[valid], vals[valid], 'o-',
+                color=COLOUR_LIST[idx % len(COLOUR_LIST)],
+                linewidth=1.5, markersize=6, label=lbl)
+    _add_threshold(ax)
+    ax.set_xlabel('Argon concentration (%)')
+    ax.set_ylabel('Metastable / resonant line ratio')
+    ax.legend(frameon=False, fontsize=8, loc='upper left')
+    apply_thesis_style(ax)
+
+    # ── Panel 3: High-lying Ar** ─────────────────────────────────────────────
+    ax      = axes[2]
+    wl_list = sorted(AR_HIGH.keys())
+    ref_idx = 0   # normalise to lowest Ar% value
+
+    for j, wl_c in enumerate(wl_list):
+        vals    = np.array([r['ar_high'].get(wl_c, 0.0) for r in grp])
+        ref_val = vals[ref_idx] if vals[ref_idx] > 0 else 1.0
+        vals_n  = vals / ref_val
+        ax.plot(ar, vals_n, 'o-',
+                color=COLOUR_LIST[(j + 3) % len(COLOUR_LIST)],
+                linewidth=1.5, markersize=6,
+                label=f'{wl_c:.0f} nm')
+
+    ax.axhline(1.0, color=COLOURS['grey'], lw=0.6, ls=':', alpha=0.6)
+    _add_threshold(ax)
+    ax.set_xlabel('Argon concentration (%)')
+    ax.set_ylabel('Intensity / intensity at lowest Ar%')
+    ax.legend(frameon=False, fontsize=8, loc='upper left')
+    apply_thesis_style(ax)
+
+    plt.tight_layout()
+    safe = f"{power:.0f}W_{pressure:.0f}mTorr"
+    plt.savefig(f'pooling_{safe}.png', dpi=150, bbox_inches='tight')
+
+
+# ─────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────
+
+if __name__ == '__main__':
+    process_and_plot()
