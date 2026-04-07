@@ -3,6 +3,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import re
 import os
+import tkinter as tk
+from tkinter import filedialog
 from scipy.stats import linregress
 
 # ─────────────────────────────────────────────
@@ -77,32 +79,46 @@ def calculate_vibrational_temperature(df):
     return None, None, None, None, None, None
 
 
-def process_and_plot(directory="."):
-    files = [f for f in os.listdir(directory) if f.endswith('.txt')]
+def select_files():
+    """Open a file explorer dialog to select .txt spectrum files."""
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    try:
+        selected = filedialog.askopenfilenames(
+            title="Select OES Spectrum Files",
+            filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+    return list(selected)
 
+
+def process_and_plot(files):
     if not files:
-        print("No .txt files found in the directory.")
+        print("No files selected. Exiting.")
         return
 
     power_trends    = {}
     pressure_trends = {}
 
-    print(f"Found {len(files)} files. Starting analysis...")
+    print(f"\nSelected {len(files)} file(s). Starting analysis...")
 
-    for f in files:
-        power, pressure = extract_experiment_params(f)
+    for filepath in files:
+        f = os.path.basename(filepath)
+        power, pressure = extract_experiment_params(filepath)
 
         if power is None or pressure is None:
             print(f"Skipping {f}: Could not find Power or Pressure in name.")
             continue
 
         try:
-            df     = pd.read_csv(os.path.join(directory, f))
+            df     = pd.read_csv(filepath)
             result = calculate_vibrational_temperature(df)
             tvib, r2, slope, intercept, x_dat, y_dat = result
 
             if tvib:
-                print(f"Analyzed {f}: Tvib = {tvib:.0f} K (R²={r2:.3f})")
+                print(f"Analysed {f}: Tvib = {tvib:.0f} K (R²={r2:.3f})")
 
                 # Boltzmann plot
                 fig, ax = plt.subplots(figsize=(8, 6))
@@ -117,7 +133,6 @@ def process_and_plot(directory="."):
                         '--', color=COLOURS['red'], linewidth=1.5,
                         label=f'Linear fit ($R^2$ = {r2:.3f})')
 
-                # Tvib annotation inside plot instead of title
                 ax.text(0.98, 0.95,
                         f'$T_{{vib}}$ = {tvib:.0f} K',
                         transform=ax.transAxes, ha='right', va='top',
@@ -138,6 +153,9 @@ def process_and_plot(directory="."):
                 if pressure not in pressure_trends:
                     pressure_trends[pressure] = []
                 pressure_trends[pressure].append(tvib)
+
+            else:
+                print(f"Skipping {f}: Could not calculate Tvib (insufficient peaks found).")
 
         except Exception as e:
             print(f"Error processing {f}: {e}")
@@ -172,4 +190,5 @@ def process_and_plot(directory="."):
 
 
 if __name__ == "__main__":
-    process_and_plot(r"C:\Users\User\oceanview\Nitrogen\Corrected\pressure vs argon\31W")
+    files = select_files()
+    process_and_plot(files)
