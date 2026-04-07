@@ -27,6 +27,9 @@ PRESSURE_COLOURS = [
     '#8172B2', '#4DAFAA', '#222222', '#e377c2',
 ]
 
+# NEW: Marker list for distinct shapes
+MARKERS = ['o', 's', '^', 'D', 'v', 'p', 'h', '*']
+
 def apply_thesis_style(ax):
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
@@ -53,11 +56,6 @@ sps_peaks = [
 # ─────────────────────────────────────────────
 
 def extract_experiment_params(filename):
-    """Extracts Flow Rate (sccm) and Pressure (mTorr) from filename.
-    
-    Expects patterns like:  25sccm  /  30 sccm  /  45sccm
-    and  30mTorr  /  45 mTorr
-    """
     base_name = os.path.basename(filename)
     flow_match     = re.search(r'(\d+\.?\d*)\s*sccm',  base_name, re.IGNORECASE)
     pressure_match = re.search(r'(\d+\.?\d*)\s*mTorr', base_name, re.IGNORECASE)
@@ -89,77 +87,7 @@ def calculate_vibrational_temperature(df):
 
     return None, None, None, None, None, None, None, None
 
-def plot_boltzmann_residuals(files):
-    """
-    For each file, computes the residual of each SPS transition
-    from the Boltzmann linear fit and plots them grouped by file.
-    Residual = y_measured - y_fitted  at each vibrational level v'.
-    """
-    fig, ax = plt.subplots(figsize=(9, 6))
 
-    v_primes = [p['v_prime'] for p in sps_peaks]
-    colour_list = list(COLOURS.values())
-
-    for i, filepath in enumerate(files):
-        f = os.path.basename(filepath)
-        flow, pressure = extract_experiment_params(filepath)
-
-        if flow is None or pressure is None:
-            print(f"Skipping {f}: Could not parse parameters.")
-            continue
-
-        try:
-            df     = pd.read_csv(filepath)
-            result = calculate_vibrational_temperature(df)
-            tvib, r2, slope, intercept, x_dat, y_dat, slope_err, tvib_err = result
-
-            if tvib is None or x_dat is None:
-                print(f"Skipping {f}: Boltzmann fit failed.")
-                continue
-
-            # Residuals: measured ln(I/νA) minus fitted value at each E_v'
-            x_arr      = np.array(x_dat)
-            y_arr      = np.array(y_dat)
-            y_fitted   = slope * x_arr + intercept
-            residuals  = y_arr - y_fitted
-
-            # Match residuals back to v' levels
-            # x_dat is ordered by sps_peaks so index maps directly
-            v_levels = [sps_peaks[j]['v_prime']
-                        for j, E in enumerate([p['E'] for p in sps_peaks])
-                        if E in x_dat]
-
-            colour = colour_list[i % len(colour_list)]
-            label  = f'{flow:.0f} sccm, {pressure:.0f} mTorr'
-
-            ax.plot(
-                v_levels, residuals,
-                'o--',
-                color=colour,
-                linewidth=1.2, markersize=5,
-                label=label,
-            )
-
-            # Print to console as well
-            print(f"\nResiduals for {f}  (Tvib = {tvib:.0f} K, R²={r2:.3f})")
-            print(f"  {'v_prime':<10} {'E (cm⁻¹)':<12} {'y_meas':<12} "
-                  f"{'y_fit':<12} {'residual':<12}")
-            for j, (xv, yv, yf, res) in enumerate(
-                    zip(x_arr, y_arr, y_fitted, residuals)):
-                print(f"  {v_levels[j]:<10} {xv:<12.1f} {yv:<12.4f} "
-                      f"{yf:<12.4f} {res:<12.4f}")
-
-        except Exception as e:
-            print(f"Error processing {f}: {e}")
-
-    ax.axhline(0, color='black', linewidth=0.8, linestyle='--', label='Boltzmann fit')
-    ax.set_xlabel("Upper Vibrational Level $v'$")
-    ax.set_ylabel(r"Residual $\left[\ln(I/\nu A) - \mathrm{fit}\right]$")
-    ax.set_xticks(v_primes)
-    ax.legend(frameon=False, fontsize=8)
-    apply_thesis_style(ax)
-    plt.tight_layout()
-    plt.show()
 def ask_error_bar_method():
     root = tk.Tk()
     root.withdraw()
@@ -233,7 +161,6 @@ def process_and_plot(files, error_method, confidence):
         print("No files selected. Exiting.")
         return
 
-    # data[pressure][flow] = list of (tvib, tvib_err)
     data = {}
 
     print(f"\nSelected {len(files)} file(s). Starting analysis...")
@@ -271,11 +198,13 @@ def process_and_plot(files, error_method, confidence):
         print("No valid data found to plot trends.")
         return
 
-    # ── Tvib vs Flow Rate — one coloured line per pressure ────────────
+    # ── Tvib vs Flow Rate — colored lines and shapes by pressure ────────────
     fig, ax = plt.subplots(figsize=(9, 6))
     sorted_pressures = sorted(data.keys())
-    colour_map = {p: PRESSURE_COLOURS[i % len(PRESSURE_COLOURS)]
-                  for i, p in enumerate(sorted_pressures)}
+    
+    # Create Maps for Color and Shape
+    colour_map = {p: PRESSURE_COLOURS[i % len(PRESSURE_COLOURS)] for i, p in enumerate(sorted_pressures)}
+    marker_map = {p: MARKERS[i % len(MARKERS)] for i, p in enumerate(sorted_pressures)}
 
     for pressure in sorted_pressures:
         flow_dict    = data[pressure]
@@ -289,17 +218,17 @@ def process_and_plot(files, error_method, confidence):
             tvib_means.append(np.mean(tv_vals))
             tvib_errs_plot.append(compute_error(tv_vals, tv_errs, error_method, confidence))
 
+        # Updated: Using dynamic marker shape
         ax.errorbar(
             flows_sorted, tvib_means,
             yerr=tvib_errs_plot,
-            fmt='o-',
+            fmt=marker_map[pressure] + '-',  # Combined marker and line
             color=colour_map[pressure],
-            linewidth=1.5, markersize=5,
+            linewidth=1.5, markersize=7,    # Slightly larger markers
             capsize=4, capthick=0.8, elinewidth=0.8,
             label=f'{pressure:.0f} mTorr',
         )
 
-    # Mark expected flow rate steps
     ax.set_xticks([25, 30, 35, 40, 45, 50])
     ax.set_xlabel('Flow Rate (sccm)')
     ax.set_ylabel('$T_{vib}$ (K)')
@@ -308,7 +237,7 @@ def process_and_plot(files, error_method, confidence):
     plt.tight_layout()
     plt.show()
 
-    # ── Tvib vs Pressure — one coloured line per flow rate ────────────
+    # ── Tvib vs Pressure — colored lines and shapes by flow rate ────────────
     data_by_flow = {}
     for pressure, flow_dict in data.items():
         for flow, entries in flow_dict.items():
@@ -318,8 +247,10 @@ def process_and_plot(files, error_method, confidence):
 
     fig2, ax2 = plt.subplots(figsize=(9, 6))
     sorted_flows  = sorted(data_by_flow.keys())
-    colour_map_fl = {fl: PRESSURE_COLOURS[i % len(PRESSURE_COLOURS)]
-                     for i, fl in enumerate(sorted_flows)}
+    
+    # Create Maps for Color and Shape
+    colour_map_fl = {fl: PRESSURE_COLOURS[i % len(PRESSURE_COLOURS)] for i, fl in enumerate(sorted_flows)}
+    marker_map_fl = {fl: MARKERS[i % len(MARKERS)] for i, fl in enumerate(sorted_flows)}
 
     for flow in sorted_flows:
         pressure_dict    = data_by_flow[flow]
@@ -333,12 +264,13 @@ def process_and_plot(files, error_method, confidence):
             tvib_means.append(np.mean(tv_vals))
             tvib_errs_plot.append(compute_error(tv_vals, tv_errs, error_method, confidence))
 
+        # Updated: Using dynamic marker shape
         ax2.errorbar(
             pressures_sorted, tvib_means,
             yerr=tvib_errs_plot,
-            fmt='o-',
+            fmt=marker_map_fl[flow] + '-', # Combined marker and line
             color=colour_map_fl[flow],
-            linewidth=1.5, markersize=5,
+            linewidth=1.5, markersize=7,    # Slightly larger markers
             capsize=4, capthick=0.8, elinewidth=0.8,
             label=f'{flow:.0f} sccm',
         )
@@ -351,10 +283,6 @@ def process_and_plot(files, error_method, confidence):
     plt.show()
 
 
-# ─────────────────────────────────────────────
-#  Entry point
-# ─────────────────────────────────────────────
-
 if __name__ == "__main__":
     files = select_files()
 
@@ -366,4 +294,3 @@ if __name__ == "__main__":
         print(f"\nError method : {error_method}")
         print(f"Confidence   : {confidence}")
         process_and_plot(files, error_method, confidence)
-        plot_boltzmann_residuals(files)
