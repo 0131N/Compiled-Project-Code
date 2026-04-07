@@ -1,0 +1,196 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+import os
+
+# 1. PEAK DEFINITIONS FOR Te (Ion vs Neutral)
+# We are looking for the N2+ FNS (391.4 nm) and the N2 SPS (380.5 nm)
+# The threshold energies (E_th) are in eV.
+peaks_te = {
+    'ion':     {'wl': 391.4, 'E_th': 18.7, 'name': 'N2+ (FNS)'},
+    'neutral': {'wl': 380.5, 'E_th': 11.0, 'name': 'N2 (SPS)'}
+}
+
+def extract_experiment_params(filename):
+    """Extracts Power and Pressure from filename using robust regex."""
+    base_name = os.path.basename(filename)
+    power_match = re.search(r'(\d+\.?\d*)\s*W', base_name, re.IGNORECASE)
+    pressure_match = re.search(r'(\d+\.?\d*)\s*mTorr', base_name, re.IGNORECASE)
+    
+    p = float(power_match.group(1)) if power_match else None
+    pr = float(pressure_match.group(1)) if pressure_match else None 
+    return p, pr
+
+def calculate_te_and_ne(df, pressure_mtorr):
+    """Calculates Te and relative ne using the 391/380 ratio."""
+    # Find Ion Peak (391.4 nm)
+    mask_ion = (df['wavelength_nm'] > peaks_te['ion']['wl'] - 0.5) & (df['wavelength_nm'] < peaks_te['ion']['wl'] + 0.5)
+    region_ion = df[mask_ion]
+    
+    # Find Neutral Peak (380.5 nm)
+    mask_neutral = (df['wavelength_nm'] > peaks_te['neutral']['wl'] - 0.5) & (df['wavelength_nm'] < peaks_te['neutral']['wl'] + 0.5)
+    region_neutral = df[mask_neutral]
+    
+    if not region_ion.empty and not region_neutral.empty:
+        i_ion = region_ion['cal_intensity'].max()
+        i_neutral = region_neutral['cal_intensity'].max()
+        
+        # Get actual wavelengths where max occurred (for plotting)
+        wl_ion_actual = region_ion.loc[region_ion['cal_intensity'].idxmax(), 'wavelength_nm']
+        wl_neutral_actual = region_neutral.loc[region_neutral['cal_intensity'].idxmax(), 'wavelength_nm']
+        
+        if i_neutral > 0 and i_ion > 0:
+            # 1. Calculate Ratio
+            ratio = i_ion / i_neutral
+            
+            # 2. Estimate Te (eV)
+            # NOTE: This is an empirical linear fit based on your earlier ratio of 1.138 -> ~4.0 eV.
+            # You should replace this with a lookup table or polynomial fit from your exact cross-section data if needed.
+            # 2. Calculate Te (eV) using the Arrhenius/Maxwellian cross-section model
+            # Delta E is the difference in threshold energies (18.7 eV - 11.0 eV = 7.7 eV)
+            delta_E = peaks_te['ion']['E_th'] - peaks_te['neutral']['E_th']
+            
+            # 'A' is the pre-exponential calibration constant. 
+            # If a ratio of 1.138 corresponds to exactly 4.0 eV in your specific 
+            # Corona Model, then A is approx 7.8 (ln(A) = 2.054).
+            # You will update this 'ln_A' value once you pull your exact cross-sections from LXCat.
+            ln_A = 1.0566 
+            
+            # The physical equation for Te:
+            try:
+                t_e = delta_E / (ln_A - np.log(ratio))
+                
+                # Sanity check: if ratio is too high, log blows up or Te goes negative
+                if t_e <= 0 or t_e > 20: 
+                    t_e = None 
+            except ZeroDivisionError:
+                t_e = None
+            
+            # 3. Calculate Relative ne
+            # Formula: ne is proportional to I_ion / (gas_density * rate_coefficient)
+            # rate_coefficient k(Te) is roughly proportional to exp(-E_th / Te)
+            # gas_density is proportional to pressure_mtorr
+            pressure_val = pressure_mtorr if pressure_mtorr else 1.0 # prevent div by zero
+            k_te = np.exp(-peaks_te['ion']['E_th'] / t_e)
+            
+            # Calculate relative density (in arbitrary units)
+            ne_rel = i_ion / (pressure_val * k_te)
+            
+            return t_e, ne_rel, ratio, i_ion, i_neutral, wl_ion_actual, wl_neutral_actual
+            
+    return None, None, None, None, None, None, None
+
+def process_and_plot(directory="."):
+    files = [f for f in os.listdir(directory) if f.endswith('.txt')]
+    
+    if not files:
+        print("No .txt files found in the directory.")
+        return
+
+    # Data storage for trends
+    power_trends = {}    # {Power: {'Te': [], 'ne': []}}
+    pressure_trends = {} # {Pressure: {'Te': [], 'ne': []}}
+
+    print(f"Found {len(files)} files. Starting analysis...")
+
+    for f in files:
+        power, pressure = extract_experiment_params(f)
+        
+        if power is None or pressure is None:
+            print(f"Skipping {f}: Could not find Power or Pressure.")
+            continue
+
+        try:
+            df = pd.read_csv(os.path.join(directory, f))
+            
+            # Run the calculation
+            result = calculate_te_and_ne(df, pressure)
+            t_e, ne_rel, ratio, i_ion, i_neutral, wl_ion, wl_neut = result
+            
+            if t_e:
+                print(f"Analyzed {f}: Ratio={ratio:.3f}, Te={t_e:.2f} eV, ne(rel)={ne_rel:.2e}")
+                
+                # --- 1. PLOT INDIVIDUAL SPECTRUM TO VERIFY PEAKS ---
+                mask_plot = (df['wavelength_nm'] >= 370) & (df['wavelength_nm'] <= 400)
+                df_plot = df[mask_plot]
+                
+                plt.figure(figsize=(8, 5))
+                plt.plot(df_plot['wavelength_nm'], df_plot['cal_intensity'], 'k-', label='Spectrum')
+                
+                # Highlight the found peaks
+                plt.plot(wl_ion, i_ion, 'ro', markersize=8, label=f'391nm (Ion): {i_ion:.0f}')
+                plt.plot(wl_neut, i_neutral, 'bo', markersize=8, label=f'380nm (Neutral): {i_neutral:.0f}')
+                
+                plt.title(f'{f}\nRatio: {ratio:.3f} | Te: {t_e:.2f} eV', fontsize=12)
+                plt.xlabel('Wavelength (nm)')
+                plt.ylabel('Intensity')
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.show() 
+                # -------------------------------------------------
+
+                # Store for trends
+                if power not in power_trends: 
+                    power_trends[power] = {'Te': [], 'ne': []}
+                power_trends[power]['Te'].append(t_e)
+                power_trends[power]['ne'].append(ne_rel)
+                
+                if pressure not in pressure_trends: 
+                    pressure_trends[pressure] = {'Te': [], 'ne': []}
+                pressure_trends[pressure]['Te'].append(t_e)
+                pressure_trends[pressure]['ne'].append(ne_rel)
+                
+        except Exception as e:
+            print(f"Error processing {f}: {e}")
+
+    # --- TREND PLOTTING (Te and ne vs Power and Pressure) ---
+    if not power_trends and not pressure_trends:
+        print("No valid data found to plot trends.")
+        return
+
+    # Create a 2x2 grid of plots
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # 1. Te vs Power (Top Left)
+    if power_trends:
+        p_sorted = sorted(power_trends.keys())
+        te_means = [np.mean(power_trends[p]['Te']) for p in p_sorted]
+        ne_means = [np.mean(power_trends[p]['ne']) for p in p_sorted]
+        
+        axes[0, 0].plot(p_sorted, te_means, 'ro-', linewidth=2)
+        axes[0, 0].set_xlabel('Power (W)')
+        axes[0, 0].set_ylabel('Te (eV)')
+        axes[0, 0].set_title('Electron Temperature vs Power')
+        axes[0, 0].grid(True)
+        
+        axes[1, 0].plot(p_sorted, ne_means, 'go-', linewidth=2)
+        axes[1, 0].set_xlabel('Power (W)')
+        axes[1, 0].set_ylabel('Relative ne (a.u.)')
+        axes[1, 0].set_title('Electron Density vs Power')
+        axes[1, 0].grid(True)
+
+    # 2. Te vs Pressure (Right Column)
+    if pressure_trends:
+        pr_sorted = sorted(pressure_trends.keys())
+        te_means = [np.mean(pressure_trends[pr]['Te']) for pr in pr_sorted]
+        ne_means = [np.mean(pressure_trends[pr]['ne']) for pr in pr_sorted]
+        
+        axes[0, 1].plot(pr_sorted, te_means, 'bo-', linewidth=2)
+        axes[0, 1].set_xlabel('Pressure (mTorr)')
+        axes[0, 1].set_ylabel('Te (eV)')
+        axes[0, 1].set_title('Electron Temperature vs Pressure')
+        axes[0, 1].grid(True)
+        
+        axes[1, 1].plot(pr_sorted, ne_means, 'mo-', linewidth=2)
+        axes[1, 1].set_xlabel('Pressure (mTorr)')
+        axes[1, 1].set_ylabel('Relative ne (a.u.)')
+        axes[1, 1].set_title('Electron Density vs Pressure')
+        axes[1, 1].grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    process_and_plot(r"c:\Users\User\oceanview\Nitrogen\Corrected")
